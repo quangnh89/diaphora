@@ -50,8 +50,7 @@ if not exist "%DIAPHORA_DIR%\diaphora_ida.py" (
 
 rem IDA splits its -S script+args string on whitespace, so the diaphora
 rem checkout itself must not live under a path containing spaces.
-echo "%DIAPHORA_DIR%" | findstr /c:" " >nul
-if not errorlevel 1 (
+if not "%DIAPHORA_DIR%"=="%DIAPHORA_DIR: =%" (
   echo [ERROR] DIAPHORA_DIR contains a space, IDA's -S switch cannot handle that:
   echo         %DIAPHORA_DIR%
   echo         Move the diaphora checkout to a path without spaces.
@@ -171,6 +170,9 @@ rem ============================================================================
 rem %1 = idb/i64 path, %2 = name of the variable to receive the idat exe path
 if /I "%~x1"==".i64" (
   set "%2=%IDA_DIR%\idat64.exe"
+  if not exist "%2" (
+    set "%2=%IDA_DIR%\idat.exe"
+  )
 ) else (
   set "%2=%IDA_DIR%\idat.exe"
 )
