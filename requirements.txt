@@ -1,4 +1,4 @@
-cdifflib
+cydifflib
 scikit-learn
 joblib
 pandas

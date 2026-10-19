@@ -7,7 +7,7 @@ import json
 from collections import OrderedDict
 
 try:
-  from cdifflib import CSequenceMatcher as SequenceMatcher # type: ignore
+  from cydifflib import CSequenceMatcher as SequenceMatcher # type: ignore
 except ImportError:
   from difflib import SequenceMatcher
 

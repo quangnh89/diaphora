@@ -39,12 +39,12 @@ import diaphora_config as config
 import diaphora_heuristics
 
 try:
-  from cdifflib import CSequenceMatcher as SequenceMatcher
+  from cydifflib import CSequenceMatcher as SequenceMatcher
   HAS_CDIFFLIB = True
 except ImportError:
   HAS_CDIFFLIB = False
   if config.SHOW_IMPORT_WARNINGS:
-    print("WARNING: Python library 'cdifflib' not found. Installing it will significantly improve text diffing performance.")
+    print("WARNING: Python library 'cydifflib' not found. Installing it will significantly improve text diffing performance.")
     print("INFO: Alternatively, you can silence this warning by changing the value of SHOW_IMPORT_WARNINGS in diaphora_config.py.")
   from difflib import SequenceMatcher
 
