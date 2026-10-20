@@ -2096,12 +2096,13 @@ class CIDABinDiff(diaphora.CBinDiff):
   def do_import_one(self, ea1, ea2, force=False):
     cur = self.db_cursor()
     try:
-      sql = "select prototype, comment, mangled_function, function_flags from diff.functions where address = ?"
+      sql = "select prototype, comment, comment_norep, mangled_function, function_flags from diff.functions where address = ?"
       cur.execute(sql, (str(ea2),))
       row = cur.fetchone()
       if row is not None:
         proto = row["prototype"]
         comment = row["comment"]
+        comment_norep = row["comment_norep"]
         name = row["mangled_function"]
         flags = row["function_flags"]
 
@@ -2119,6 +2120,11 @@ class CIDABinDiff(diaphora.CBinDiff):
           func = get_func(ea1)
           if func is not None:
             set_func_cmt(func, comment, 1)
+
+        if comment_norep is not None and comment_norep != "":
+          func = get_func(ea1)
+          if func is not None:
+            set_func_cmt(func, comment_norep, 0)
 
         if flags is not None:
           set_func_attr(ea1, FUNCATTR_FLAGS, flags)
@@ -2991,6 +2997,7 @@ or selecting Edit -> Plugins -> Diaphora - Show results"""
 
     # Get function comment and compute hashes
     comment = idc.get_func_cmt(f, 1)
+    comment_norep = idc.get_func_cmt(f, 0)
     bytes_hash = md5(b"".join(data['bytes_hash'])).hexdigest()
     function_hash = md5(b"".join(data['function_hash'])).hexdigest()
 
@@ -3045,6 +3052,7 @@ or selecting Edit -> Plugins -> Diaphora - Show results"""
       'proto2': proto2,
       'prime': prime,
       'comment': comment,
+      'comment_norep': comment_norep,
       'bytes_hash': bytes_hash,
       'function_hash': function_hash,
       'function_flags': function_flags,
@@ -3204,6 +3212,7 @@ or selecting Edit -> Plugins -> Diaphora - Show results"""
       features['clean_microcode'],
       features['microcode_spp'],
       features['export_time'],
+      features['comment_norep'],
       features['microcode_bblocks'],
       features['microcode_bbrelations'],
       data['callers'],

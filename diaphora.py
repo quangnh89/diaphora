@@ -366,7 +366,7 @@ class CBinDiff:
     "function_hash", "bytes_sum", "md_index", "constants",
     "constants_size", "seg_rva", "assembly_addrs", "kgh_hash",
     "source_file", "userdata", "microcode", "clean_microcode",
-    "microcode_spp", "export_time", "microcode_bblocks",
+    "microcode_spp", "export_time", "comment_norep", "microcode_bblocks",
     "microcode_bbrelations", "callers", "callees", "basic_blocks_data",
     "bb_relations",
   )
@@ -952,10 +952,10 @@ class CBinDiff:
                     function_hash, bytes_sum, md_index, constants,
                     constants_count, segment_rva, assembly_addrs, kgh_hash,
                     source_file, userdata, microcode, clean_microcode,
-                    microcode_spp, export_time)
+                    microcode_spp, export_time, comment_norep)
                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
       try:
         cur.execute(sql, new_props)

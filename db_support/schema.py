@@ -82,6 +82,7 @@ TABLES = [
                           cyclomatic_complexity integer,
                           primes_value text,
                           comment text,
+                          comment_norep text,
                           mangled_function text,
                           bytes_hash text,
                           pseudocode text,
