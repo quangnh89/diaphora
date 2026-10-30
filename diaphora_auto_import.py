@@ -14,7 +14,7 @@ calling shell script can check the outcome without scraping IDA's log.
 
 Usage (run with idat/idat64 in batch/autonomous mode):
 
-    idat64 -A -S"diaphora_auto_import.py <results.sqlite> <main.sqlite> <diff.sqlite>" \
+    idat64 -A -S"diaphora_auto_import.py <results.sqlite> <main.sqlite> <diff.sqlite> [folders.json]" \
            -L<logfile> <target.i64>
 
 Arguments (positional, space-separated -- none of these paths may contain
@@ -26,9 +26,14 @@ spaces, since that is how IDA itself splits the -S argument list):
                     open in IDA (the "new"/target database)
     diff.sqlite     the exported sqlite of the source-of-truth database
                     (the "old" database names/comments/types are read from)
+    folders.json    optional, the Functions window folder layout of the old
+                    database as dumped by diaphora_dump_folders.py. Applied
+                    after the import, once the functions carry their final
+                    names. Failing to apply it does not fail the import.
 """
 
 import os
+import sys
 import traceback
 
 import idc
@@ -54,10 +59,33 @@ def _save_database():
     idc.save_database()
 
 
+def _apply_folders(folders_json):
+  """
+  Port the function folder layout of the old database. Best effort: a
+  failure here must not invalidate an otherwise successful import, so the
+  outcome is only reported, never raised.
+  """
+  if folders_json is None:
+    return "folders: not requested"
+
+  if not os.path.exists(folders_json):
+    return f"folders: {folders_json} not found, skipped"
+
+  try:
+    from diaphora_func_folders import apply_folders
+
+    moved, failed, created = apply_folders(folders_json)
+    return f"folders: {moved} moved, {failed} failed, {created} folders created"
+  except Exception:
+    traceback.print_exc()
+    return f"folders: failed, {str(sys.exc_info()[1])}"
+
+
 def main():
   filename = idc.ARGV[1]
   main_db = idc.ARGV[2]
   diff_db = idc.ARGV[3]
+  folders_json = idc.ARGV[4] if len(idc.ARGV) > 4 else None
 
   ok_flag = filename + ".ok"
   fail_flag = filename + ".fail"
@@ -77,8 +105,11 @@ def main():
     if not imported:
       raise Exception("load_and_import_all_results() reported failure, check the log above")
 
+    folders_status = _apply_folders(folders_json)
+    print(f"[folders] {folders_status}")
+
     _save_database()
-    _write_flag(ok_flag, "ok")
+    _write_flag(ok_flag, f"ok, {folders_status}")
   except Exception:
     _write_flag(fail_flag, traceback.format_exc())
   finally:

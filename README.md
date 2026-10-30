@@ -109,3 +109,55 @@ These are some screenshots of Diaphora diffing the [Microsoft bulletin MS15-050]
 Here is a screenshot of Diaphora diffing [iBoot from iOS 10.3.3 against iOS 11.0](https://blog.matteyeux.com/hacking/2018/04/04/diaphora-diff-and-ida.html):
 
 ![Diaphora diffing iBoot from iOS 10.3.3 against iOS 11.0](https://blog.matteyeux.com/images/newgraph.PNG)
+
+---
+
+# Windows automation scripts
+
+This fork adds two unattended batch scripts on top of Diaphora. Both drive IDA
+in batch mode and need no interaction.
+
+**`port_idb.bat <old.i64> <new.i64>`** copies function names, function and
+instruction comments, prototypes, struct/enum/union/typedef definitions, and
+the Functions window folder layout from an old database into a new one. The new
+database is modified in place, after a backup of it is made and kept.
+
+**`ai_diff.bat <old.i64> <new.i64> [outdir]`** runs a diffing session and writes
+the result as plain text an AI agent can read directly: the matched and
+unmatched tables as JSONL, a unified diff of the pseudo-code per changed
+function, a `summary.md`, and the raw `.sqlite` databases for SQL queries.
+Neither database is modified.
+
+## Configuration
+
+Both scripts read their settings from a `.env` file next to them. Copy the
+template once and fill in at least `IDA_DIR`:
+
+    copy .env.example .env
+
+The scripts refuse to run without that file. `.env.example` documents every
+key; this is the full list:
+
+| Variable | Used by | Default | Purpose |
+|---|---|---|---|
+| `IDA_DIR` | both | **required** | Folder holding `idat.exe` (and `idat64.exe` on IDA < 9.0) |
+| `DIAPHORA_DIR` | both | folder of the scripts | The diaphora checkout. Must not contain spaces, IDA splits its `-S` argument on whitespace |
+| `PYTHON_EXE` | both | `python` | Python 3 for the diffing and exporting steps, which need no IDA |
+| `USE_DECOMPILER` | both | `1` | `0` exports without Hex-Rays: much faster, but the diffs then show assembly instead of pseudo-code |
+| `PORT_FOLDERS` | `port_idb.bat` | `1` | `0` skips porting the function folder layout |
+| `DIAPHORA_MINIMUM_IMPORT_RATIO` | `port_idb.bat` | `0.5` | Similarity a match needs before it is imported |
+| `AI_DIFF_MAX_DIFFS` | `ai_diff.bat` | `2000` | Cap on the number of per-function `.diff` files, lowest ratio first |
+| `AI_DIFF_CONTEXT` | `ai_diff.bat` | `3` | Context lines in those diffs |
+| `AI_DIFF_MIN_RATIO` | `ai_diff.bat` | `0.0` | Drops matches below this ratio from the export |
+| `AI_DIFF_FORCE` | `ai_diff.bat` | unset | `1` re-exports even when `db\*.sqlite` is already there |
+
+A variable that is already set in the environment wins over `.env`, so a one-off
+change needs no edit:
+
+    set PORT_FOLDERS=0&& port_idb.bat old.i64 new.i64
+
+Any other `DIAPHORA_*` variable Diaphora itself reads (see
+`CBinDiff.get_value_for()` in `diaphora.py`) can go in `.env` too: the scripts
+pass their whole environment down to IDA and to `diaphora.py`.
+
+`.env` holds machine-specific paths and is deliberately not tracked by git.
