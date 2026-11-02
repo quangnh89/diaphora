@@ -1372,11 +1372,21 @@ class CIDABinDiff(diaphora.CBinDiff):
         if ok and self.is_complete_local_type(name):
           imported += 1
         else:
-          self.del_local_type(name)
           failed.append((name, definition))
 
       if len(failed) == len(pending):
+        # A whole round without a single success: retrying cannot help any
+        # more. Stop here and keep whatever half-built types the last attempt
+        # produced, because a truncated type still resolves the references
+        # other types and prototypes make to it by name, while a deleted one
+        # turns every one of them into a dangling "#42" ordinal.
         break
+
+      # Drop what this round could not build so that the next one starts from
+      # a free name: a half-parsed leftover would otherwise be mistaken for a
+      # type that is already in place.
+      for name, _ in failed:
+        self.del_local_type(name)
       pending = failed
 
     log(f"Imported {imported} type(s), {len(pending)} could not be parsed")
@@ -1856,7 +1866,13 @@ class CIDABinDiff(diaphora.CBinDiff):
 
         comment = mcmt
         cfunc.set_user_cmt(tl, comment)
-        cfunc.del_orphan_cmts()
+        #
+        # No del_orphan_cmts() here. Hex-Rays only marks a user comment as
+        # used while it prints the ctree, and this cfunc was decompiled before
+        # the comment existed, so the comment we just set still counts as an
+        # orphan: deleting them discards it before save_user_cmts() can store
+        # it.
+        #
         cfunc.save_user_cmts()
 
     tmp_ea = None
