@@ -10,3 +10,4 @@
 *.diaphora
 *.aidiff/
 .env
+debug/

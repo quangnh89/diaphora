@@ -128,6 +128,52 @@ unmatched tables as JSONL, a unified diff of the pseudo-code per changed
 function, a `summary.md`, and the raw `.sqlite` databases for SQL queries.
 Neither database is modified.
 
+## Which script do I need?
+
+Both take the same two databases, so the only question is what you want out of
+them:
+
+| You want | Run |
+|---|---|
+| To know what changed between the two builds (patch diffing) | `ai_diff.bat` |
+| To carry your analysis of the old build over to the new one | `port_idb.bat` |
+| Both | `port_idb.bat` first, then `ai_diff.bat` |
+
+### Two builds of the same module
+
+The common case: the same binary one version apart, say
+`10.0.26100.9711` and `10.0.26100.9838`, with the older one already analysed
+and named.
+
+    port_idb.bat  D:\work\old\module.i64  D:\work\new\module.i64
+    ai_diff.bat   D:\work\old\module.i64  D:\work\new\module.i64
+
+Porting first pays off in the diff. Every per-function diff is named and
+labelled after the function names of both sides, so once the new database
+carries the old names, prototypes and types, a diff reads
+`old/CheckAccessToken` against `new/CheckAccessToken` instead of
+`sub_140012340`, and both sides of the pseudo-code use the same variable and
+struct names. What is left in the diff is the change itself.
+
+Two things to watch out for:
+
+ * Running `ai_diff.bat` **before** `port_idb.bat` leaves a `db\new.sqlite`
+   behind that the next run reuses instead of exporting the ported database.
+   Force the export, or write to a different output directory:
+
+       set AI_DIFF_FORCE=1&& ai_diff.bat old.i64 new.i64
+
+ * `port_idb.bat` imports every match at or above
+   `DIAPHORA_MINIMUM_IMPORT_RATIO` (`0.5`), so a bad match can put a wrong name
+   into the new database, which the AI export then repeats. Two builds off the
+   same branch are close enough for the default; raise it to `0.7` or so when
+   the builds are further apart, for instance built with a different compiler.
+
+Each script exports both databases itself and `port_idb.bat` deletes its
+scratch copies afterwards, so running both means four exports, by far the
+slowest part of the whole thing. Do not run the two in parallel on the same
+database either: IDA locks it.
+
 ## Configuration
 
 Both scripts read their settings from a `.env` file next to them. Copy the

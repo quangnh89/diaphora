@@ -17,6 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -38,6 +39,7 @@ import ida_idp
 import ida_bytes
 import ida_graph
 import ida_kernwin
+import ida_typeinf
 
 idaapi.require("diaphora")
 
@@ -1127,8 +1129,13 @@ class CIDABinDiff(diaphora.CBinDiff):
         crashed_before = False
         continue
 
-      props = self.read_function(func)
+      # Clearing *before* reading, never after: read_function() harvests the
+      # pseudo-code comments into self.pseudo_comments and
+      # insert_instructions_to_database() reads them back when the function is
+      # saved further down. Clearing in between silently dropped every single
+      # pseudo-code comment.
       self.clear_pseudo_fields()
+      props = self.read_function(func)
       if props is False:
         continue
 
@@ -1261,57 +1268,118 @@ class CIDABinDiff(diaphora.CBinDiff):
 
     auto_wait()
 
+  _rexp_opaque_definition = re.compile(r"^(?:struct|union|enum)\s+[\w:]+\s*;$")
+  _rexp_printed_typedef = re.compile(r"^(struct|union|enum)\s+([\w:]+)\s+([\w:]+)\s*;$")
+
+  def is_complete_local_type(self, name):
+    """
+    Whether @name already names a type we can use as is in this database.
+
+    A forward declaration ("struct X;") also occupies the name, but resolves
+    to nothing and has no size, so it does not count. Note that get_struc_id()
+    cannot be used for this: since IDA 9.0 it only answers for types that are
+    already a UDT, so it returns BADADDR both for a name that is free and for
+    one taken by a dangling declaration.
+    """
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(ida_typeinf.get_idati(), name):
+      return False
+
+    size = tinfo.get_size()
+    return size not in (None, 0, ida_typeinf.BADSIZE)
+
+  def del_local_type(self, name):
+    """
+    Drop @name, so that a later parse of its definition is free to recreate it.
+    """
+    try:
+      ida_typeinf.del_named_type(
+        ida_typeinf.get_idati(), name, ida_typeinf.NTF_TYPE
+      )
+    except Exception:
+      log(f"Could not delete the type {name}: {str(sys.exc_info()[1])}")
+
+  def is_opaque_definition(self, definition):
+    """
+    Whether @definition is a bare forward declaration, i.e. the type was
+    already opaque in the source database and carries nothing to port.
+    """
+    body = "\n".join(
+      line for line in definition.splitlines() if not line.startswith("#pragma")
+    )
+    return self._rexp_opaque_definition.match(body.strip()) is not None
+
+  def as_typedef(self, definition):
+    """
+    Turn the declarations IDA prints for a typedef into actual typedefs.
+
+    A local type aliasing a tagged type is printed as "struct _HV_VP_SET
+    HV_VP_SET;", which parses back as a *variable* declaration: it defines no
+    type at all, and reports zero errors while doing so.
+    """
+    lines = []
+    for line in definition.splitlines():
+      match = self._rexp_printed_typedef.match(line.strip())
+      if match is not None and match.group(2) != match.group(3):
+        lines.append(f"typedef {match.group(1)} {match.group(2)} {match.group(3)};")
+      else:
+        lines.append(line)
+    return "\n".join(lines)
+
   def import_definitions(self):
     """
-    Import structs, enums and unions
+    Import structs, enums and unions.
+
+    A definition referring to a type we have not created yet fails to parse as
+    a whole, so the ones left over are retried until a whole round stops
+    making progress. A failed parse can still leave a truncated type behind,
+    which would make the next round believe the name is already taken, hence
+    the deletion before every retry.
     """
     cur = self.db_cursor()
     try:
       sql = "select type, name, value from diff.program_data where type in ('structure', 'struct', 'enum', 'union')"
       cur.execute(sql)
-      rows = diaphora.result_iter(cur)
-
-      new_rows = set()
-      for row in rows:
-        if row["name"] is None:
-          continue
-
-        the_name = row["name"].split(" ")[0]
-        if get_struc_id(the_name) == BADADDR:
-          type_name = "struct"
-          if row["type"] == "enum":
-            type_name = "enum"
-          elif row["type"] == "union":
-            type_name = "union"
-
-          new_rows.add(row)
-          line = f"{type_name} {row['name']};"
-          try:
-            ret = idc.parse_decls(line)
-            if ret != 0:
-              pass
-          except:
-            log(f"Error importing type: {str(sys.exc_info()[1])}")
-
-      for _ in range(10):
-        for row in new_rows:
-          if row["name"] is None:
-            continue
-
-          the_name = row["name"].split(" ")[0]
-          if (
-            get_struc_id(the_name) == BADADDR
-            and get_struc_id(row["name"]) == BADADDR
-          ):
-            definition = self.get_valid_definition(row["value"])
-            ret = idc.parse_decls(
-              definition
-            )  # Remove the "idc." to reproduce some strange behaviour
-            if ret != 0:
-              pass
+      rows = list(diaphora.result_iter(cur))
     finally:
       cur.close()
 
+    pending = []
+    for row in rows:
+      name = row["name"]
+      if name is None or "::" in name:
+        # IDA's own name for an anonymous nested UDT. It is created together
+        # with its parent, and it is no valid C identifier anyway.
+        continue
+
+      name = name.split(" ")[0]
+      if self.is_complete_local_type(name):
+        continue
+
+      definition = self.as_typedef(self.get_valid_definition(row["value"]))
+      if not self.is_opaque_definition(definition):
+        pending.append((name, definition))
+
+    imported = 0
+    while pending:
+      failed = []
+      for name, definition in pending:
+        # Both halves are needed: a struct whose parse broke halfway through
+        # is still created, truncated, with a plausible size, while a typedef
+        # to a tag we have not defined yet parses without a single error and
+        # leaves nothing resolvable behind.
+        ok = idc.parse_decls(definition, PT_SIL | PT_REPLACE) == 0
+        if ok and self.is_complete_local_type(name):
+          imported += 1
+        else:
+          self.del_local_type(name)
+          failed.append((name, definition))
+
+      if len(failed) == len(pending):
+        break
+      pending = failed
+
+    log(f"Imported {imported} type(s), {len(pending)} could not be parsed")
     auto_wait()
 
   def reinit(self, main_db, diff_db, create_choosers=True):
@@ -1856,8 +1924,9 @@ class CIDABinDiff(diaphora.CBinDiff):
     if import_syms[ea][4] is not None:
       return True
 
-    # Has pseudocode comment
-    return import_syms[ea][6] is not None
+    # Has pseudocode comment. Index 6 is the disassembly text, which is almost
+    # never None and made this check succeed for every single row.
+    return import_syms[ea][7] is not None
 
   def do_import_instruction_level_item(self, diff_rows, import_syms, matched_syms):
     """
@@ -1890,13 +1959,16 @@ class CIDABinDiff(diaphora.CBinDiff):
         ea2 = str(ea2)
         if ea1 in matched_syms and ea2 in import_syms:
           self.import_instruction(matched_syms[ea1], import_syms[ea2])
-        if ea2 in matched_syms and ea1 in import_syms:
-          self.import_instruction(matched_syms[ea2], import_syms[ea1])
 
   def import_instruction_level(self, ea1, ea2, cur):
     cur = self.db_cursor()
     try:
-      # Check first if we have any importable items
+      # Check first if we have any importable items.
+      #
+      # Only native instructions: for microcode rows the 'pseudocomment'
+      # column holds the microcode line annotations ("u=rsp.8  d=r11.8"),
+      # which have nothing to do with the user's pseudo-code comments and must
+      # never be imported as such.
       sql = """ select distinct ins.address ea, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.operand_names operand_names, ins.name name, ins.type type, ins.pseudocomment cmt, ins.pseudoitp itp
           from diff.function_bblocks bb,
              diff.functions f,
@@ -1906,6 +1978,7 @@ class CIDABinDiff(diaphora.CBinDiff):
            and bbi.basic_block_id = bb.basic_block_id
            and ins.id = bbi.instruction_id
            and f.address = ?
+           and ins.asm_type = 'native'
            and (ins.comment1 is not null
            or ins.comment2 is not null
            or ins.operand_names is not null
@@ -1940,7 +2013,8 @@ class CIDABinDiff(diaphora.CBinDiff):
            where f.id = bb.function_id
            and bbi.basic_block_id = bb.basic_block_id
            and ins.id = bbi.instruction_id
-           and f.address = ?"""
+           and f.address = ?
+           and ins.asm_type = 'native'"""
         cur.execute(sql, (str(ea1),))
         match_rows = cur.fetchall()
         if len(match_rows) > 0:
@@ -1962,20 +2036,23 @@ class CIDABinDiff(diaphora.CBinDiff):
             ]
 
           # We have 'something' to import, let's diff the assembly...
+          # Ordering is by the side marker (column 3), not by assembly_addrs
+          # (column 2): do_import_instruction_level_item() relies on row 0
+          # being the primary database and row 1 the diff one.
           sql = """select *
            from (
-          select assembly, assembly_addrs, 1
+          select assembly, assembly_addrs, 1 as side
            from functions
           where address = ?
             and assembly is not null
-       union select assembly, assembly_addrs, 2
+       union select assembly, assembly_addrs, 2 as side
            from diff.functions
           where address = ?
             and assembly is not null)
-          order by 2 asc"""
+          order by side asc"""
           cur.execute(sql, (str(ea1), str(ea2)))
           diff_rows = cur.fetchall()
-          if len(diff_rows) > 0:
+          if len(diff_rows) == 2:
             try:
               self.do_import_instruction_level_item(
                 diff_rows, import_syms, matched_syms
@@ -1986,14 +2063,38 @@ class CIDABinDiff(diaphora.CBinDiff):
     finally:
       cur.close()
 
+  def get_type_candidates(self, row):
+    """
+    The prototypes of a diff.functions row worth trying, best first.
+
+    'prototype' is the first line of the decompiler's output, so Hex-Rays
+    line wrapping truncates it to something like "char __fastcall f(" for
+    every function with a long signature: a third of the named functions in a
+    real database. 'prototype2' is idc.get_type(), which never wraps, but it
+    is an abstract declarator and IDA's parser insists on a name, so a dummy
+    one is spliced in. apply_type() only uses the type, never that name.
+    """
+    candidates = []
+    proto2 = row["prototype2"]
+    if proto2 is not None and proto2 != "int()":
+      pos = proto2.find("(")
+      if pos > -1:
+        candidates.append(f"{proto2[:pos]} f{proto2[pos:]}")
+      candidates.append(proto2)
+
+    proto = row["prototype"]
+    if proto is not None and proto != "int()":
+      candidates.append(proto)
+
+    return candidates
+
   def do_import_one(self, ea1, ea2, force=False):
     cur = self.db_cursor()
     try:
-      sql = "select prototype, comment, comment_norep, mangled_function, function_flags from diff.functions where address = ?"
+      sql = "select prototype, prototype2, comment, comment_norep, mangled_function, function_flags from diff.functions where address = ?"
       cur.execute(sql, (str(ea2),))
       row = cur.fetchone()
       if row is not None:
-        proto = row["prototype"]
         comment = row["comment"]
         comment_norep = row["comment_norep"]
         name = row["mangled_function"]
@@ -2006,8 +2107,11 @@ class CIDABinDiff(diaphora.CBinDiff):
               if set_name(ea1, f"{name}_{i}", SN_NOWARN | SN_NOCHECK):
                 break
 
-        if proto is not None and proto != "int()":
-          SetType(ea1, proto)
+        # SetType() returns 0 when it cannot parse the declaration, which used
+        # to be ignored: a truncated prototype was dropped without a trace.
+        candidates = self.get_type_candidates(row)
+        if candidates and not any(SetType(ea1, proto) for proto in candidates):
+          log(f"Could not set the type of 0x{ea1:x}: {candidates[0]}")
 
         if comment is not None and comment != "":
           func = get_func(ea1)
