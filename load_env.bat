@@ -13,7 +13,7 @@ rem  variables land in the caller's scope.
 rem
 rem  A variable that is already set is NOT overwritten, so a one-off override
 rem  from the command line still wins over the file:
-rem      set IDA_DIR=D:\ida-9.1 && port_idb.bat old.i64 new.i64
+rem      set IDA_DIR=D:\ida-9.1&& diaphora_run.bat old.i64 new.i64
 rem
 rem  File format:
 rem    KEY=VALUE        one pair per line; VALUE may itself contain "="

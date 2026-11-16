@@ -112,98 +112,107 @@ Here is a screenshot of Diaphora diffing [iBoot from iOS 10.3.3 against iOS 11.0
 
 ---
 
-# Windows automation scripts
+# Windows automation script
 
-This fork adds two unattended batch scripts on top of Diaphora. Both drive IDA
-in batch mode and need no interaction.
+This fork adds `diaphora_run.bat`, an unattended Diaphora pass over two IDA
+databases. It drives IDA in batch mode and needs no interaction.
 
-**`port_idb.bat <old.i64> <new.i64>`** copies function names, function and
-instruction comments, prototypes, struct/enum/union/typedef definitions, and
-the Functions window folder layout from an old database into a new one. The new
-database is modified in place, after a backup of it is made and kept.
+    diaphora_run.bat <old.i64|old.idb> <new.i64|new.idb> [outdir] [options]
 
-**`ai_diff.bat <old.i64> <new.i64> [outdir]`** runs a diffing session and writes
-the result as plain text an AI agent can read directly: the matched and
-unmatched tables as JSONL, a unified diff of the pseudo-code per changed
-function, a `summary.md`, and the raw `.sqlite` databases for SQL queries.
-Neither database is modified.
+It produces two things, and does both by default:
 
-## Which script do I need?
+**Porting** copies function names, function and instruction comments,
+prototypes, struct/enum/union/typedef definitions, and the Functions window
+folder layout from the old database into the new one. The new database is
+modified in place, after a backup of it is made and kept.
 
-Both take the same two databases, so the only question is what you want out of
-them:
+**The AI export** writes the diffing result as plain text an AI agent can read
+directly: the matched and unmatched tables as JSONL, a unified diff of the
+pseudo-code per changed function, a `summary.md`, and the raw `.sqlite`
+databases for SQL queries.
 
-| You want | Run |
+| Option | Effect |
 |---|---|
-| To know what changed between the two builds (patch diffing) | `ai_diff.bat` |
-| To carry your analysis of the old build over to the new one | `port_idb.bat` |
-| Both | `port_idb.bat` first, then `ai_diff.bat` |
+| *(none)* | Both: port into the new database and write the AI export |
+| `--port` | Port only |
+| `--ai` | AI export only |
+| `--outdir DIR` | Where the AI export goes. Default: `<new>_vs_<old>.aidiff` next to the new database |
+| `--no-folders` | Do not port the function folder layout |
+| `--force` | Export again even when a previous export is there |
+| `-h`, `--help` | Usage |
 
-### Two builds of the same module
+## Two builds of the same module
 
-The common case: the same binary one version apart, say
-`10.0.26100.9711` and `10.0.26100.9838`, with the older one already analysed
-and named.
+The common case: the same binary one version apart, say `10.0.26100.9711` and
+`10.0.26100.9838`, with the older one already analysed and named.
 
-    port_idb.bat  D:\work\old\module.i64  D:\work\new\module.i64
-    ai_diff.bat   D:\work\old\module.i64  D:\work\new\module.i64
+    diaphora_run.bat D:\work\old\module.i64 D:\work\new\module.i64
 
-Porting first pays off in the diff. Every per-function diff is named and
-labelled after the function names of both sides, so once the new database
-carries the old names, prototypes and types, a diff reads
-`old/CheckAccessToken` against `new/CheckAccessToken` instead of
-`sub_140012340`, and both sides of the pseudo-code use the same variable and
-struct names. What is left in the diff is the change itself.
-
-Two things to watch out for:
-
- * Running `ai_diff.bat` **before** `port_idb.bat` leaves a `db\new.sqlite`
-   behind that the next run reuses instead of exporting the ported database.
-   Force the export, or write to a different output directory:
-
-       set AI_DIFF_FORCE=1&& ai_diff.bat old.i64 new.i64
-
- * `port_idb.bat` imports every match at or above
-   `DIAPHORA_MINIMUM_IMPORT_RATIO` (`0.5`), so a bad match can put a wrong name
-   into the new database, which the AI export then repeats. Two builds off the
-   same branch are close enough for the default; raise it to `0.7` or so when
-   the builds are further apart, for instance built with a different compiler.
-
-Each script exports both databases itself and `port_idb.bat` deletes its
-scratch copies afterwards, so running both means four exports, by far the
-slowest part of the whole thing. Do not run the two in parallel on the same
+Both deliverables need the same expensive groundwork — export the old database,
+export the new one, diff them — so the script does that once and feeds both
+halves from it. Running the two halves as separate commands would export four
+times and diff twice. Do not run two copies in parallel against the same
 database either: IDA locks it.
+
+The AI export is written **before** the porting step, so it describes the two
+databases exactly as they were diffed: honest similarity ratios, and the names
+each side had at diff time. That means the new side of a diff still reads
+`sub_140012340`; `matches.jsonl` pairs it with the old name, so nothing is
+lost. As a side effect the export survives a failing import.
+
+If you would rather have the diffs themselves labelled with the ported names —
+`old/CheckAccessToken` against `new/CheckAccessToken`, with both sides of the
+pseudo-code using the same variable and struct names, leaving only the real
+change in the diff — port first and then export against the ported database:
+
+    diaphora_run.bat D:\work\old\module.i64 D:\work\new\module.i64 --port
+    diaphora_run.bat D:\work\old\module.i64 D:\work\new\module.i64 --ai --force
+
+That costs one extra export of the new database, and the ratios it reports are
+inflated, because porting the symbols is itself what made the two sides look
+alike.
+
+One thing to watch out for either way: porting imports every match at or above
+`DIAPHORA_MINIMUM_IMPORT_RATIO` (`0.5`), so a bad match can put a wrong name
+into the new database. Two builds off the same branch are close enough for the
+default; raise it to `0.7` or so when the builds are further apart, for
+instance built with a different compiler.
 
 ## Configuration
 
-Both scripts read their settings from a `.env` file next to them. Copy the
-template once and fill in at least `IDA_DIR`:
+The script reads its settings from a `.env` file next to it. Copy the template
+once and fill in at least `IDA_DIR`:
 
     copy .env.example .env
 
-The scripts refuse to run without that file. `.env.example` documents every
+The script refuses to run without that file. `.env.example` documents every
 key; this is the full list:
 
-| Variable | Used by | Default | Purpose |
+| Variable | Applies to | Default | Purpose |
 |---|---|---|---|
-| `IDA_DIR` | both | **required** | Folder holding `idat.exe` (and `idat64.exe` on IDA < 9.0) |
-| `DIAPHORA_DIR` | both | folder of the scripts | The diaphora checkout. Must not contain spaces, IDA splits its `-S` argument on whitespace |
-| `PYTHON_EXE` | both | `python` | Python 3 for the diffing and exporting steps, which need no IDA |
-| `USE_DECOMPILER` | both | `1` | `0` exports without Hex-Rays: much faster, but the diffs then show assembly instead of pseudo-code |
-| `PORT_FOLDERS` | `port_idb.bat` | `1` | `0` skips porting the function folder layout |
-| `DIAPHORA_MINIMUM_IMPORT_RATIO` | `port_idb.bat` | `0.5` | Similarity a match needs before it is imported |
-| `AI_DIFF_MAX_DIFFS` | `ai_diff.bat` | `2000` | Cap on the number of per-function `.diff` files, lowest ratio first |
-| `AI_DIFF_CONTEXT` | `ai_diff.bat` | `3` | Context lines in those diffs |
-| `AI_DIFF_MIN_RATIO` | `ai_diff.bat` | `0.0` | Drops matches below this ratio from the export |
-| `AI_DIFF_FORCE` | `ai_diff.bat` | unset | `1` re-exports even when `db\*.sqlite` is already there |
+| `IDA_DIR` | both halves | **required** | Folder holding `idat.exe` (and `idat64.exe` on IDA < 9.0) |
+| `DIAPHORA_DIR` | both halves | folder of the script | The diaphora checkout. Must not contain spaces, IDA splits its `-S` argument on whitespace |
+| `PYTHON_EXE` | both halves | `python` | Python 3 for the diffing and exporting steps, which need no IDA |
+| `USE_DECOMPILER` | both halves | `1` | `0` exports without Hex-Rays: much faster, but the diffs then show assembly instead of pseudo-code |
+| `PORT_FOLDERS` | `--port` | `1` | `0` skips porting the function folder layout, same as `--no-folders` |
+| `DIAPHORA_MINIMUM_IMPORT_RATIO` | `--port` | `0.5` | Similarity a match needs before it is imported |
+| `AI_DIFF_MAX_DIFFS` | `--ai` | `2000` | Cap on the number of per-function `.diff` files, lowest ratio first |
+| `AI_DIFF_CONTEXT` | `--ai` | `3` | Context lines in those diffs |
+| `AI_DIFF_MIN_RATIO` | `--ai` | `0.0` | Drops matches below this ratio from the export |
+| `AI_DIFF_FORCE` | `--ai` | unset | `1` re-exports even when `db\*.sqlite` is already there, same as `--force` |
+
+An existing export in `<outdir>\db` is reused rather than redone, since
+exporting is the slow part. The new database is the exception: whenever porting
+is involved it is always exported afresh, because a cached export may be one
+that a previous import has already rewritten.
 
 A variable that is already set in the environment wins over `.env`, so a one-off
 change needs no edit:
 
-    set PORT_FOLDERS=0&& port_idb.bat old.i64 new.i64
+    set USE_DECOMPILER=0&& diaphora_run.bat old.i64 new.i64
 
 Any other `DIAPHORA_*` variable Diaphora itself reads (see
-`CBinDiff.get_value_for()` in `diaphora.py`) can go in `.env` too: the scripts
-pass their whole environment down to IDA and to `diaphora.py`.
+`CBinDiff.get_value_for()` in `diaphora.py`) can go in `.env` too: the script
+passes its whole environment down to IDA and to `diaphora.py`.
 
 `.env` holds machine-specific paths and is deliberately not tracked by git.
