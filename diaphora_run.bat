@@ -64,6 +64,9 @@ rem Defaults for everything .env may legitimately leave out.
 if not defined DIAPHORA_DIR set "DIAPHORA_DIR=%SELF_DIR%"
 if not defined PYTHON_EXE set "PYTHON_EXE=python"
 if not defined PORT_FOLDERS set "PORT_FOLDERS=1"
+if not defined PORT_LVARS set "PORT_LVARS=1"
+if not defined PORT_TYPES set "PORT_TYPES=all"
+if not defined PROTECT_OLD set "PROTECT_OLD=1"
 if not defined USE_DECOMPILER set "USE_DECOMPILER=1"
 if not defined AI_DIFF_MAX_DIFFS set "AI_DIFF_MAX_DIFFS=2000"
 if not defined AI_DIFF_CONTEXT set "AI_DIFF_CONTEXT=3"
@@ -81,12 +84,16 @@ set "OUTDIR="
 set "DO_PORT="
 set "DO_AI="
 set "WANT_OUTDIR="
+set "WANT_TYPEMODE="
 
 :parse_args
 if "%~1"=="" goto :args_done
 if defined WANT_OUTDIR (
   set "OUTDIR=%~f1"
   set "WANT_OUTDIR="
+) else if defined WANT_TYPEMODE (
+  set "PORT_TYPES=%~1"
+  set "WANT_TYPEMODE="
 ) else if /I "%~1"=="--help" (
   goto :usage
 ) else if /I "%~1"=="-h" (
@@ -99,6 +106,14 @@ if defined WANT_OUTDIR (
   set "DO_AI=1"
 ) else if /I "%~1"=="--no-folders" (
   set "PORT_FOLDERS=0"
+) else if /I "%~1"=="--no-lvars" (
+  set "PORT_LVARS=0"
+) else if /I "%~1"=="--no-types" (
+  set "PORT_TYPES=0"
+) else if /I "%~1"=="--no-protect-old" (
+  set "PROTECT_OLD=0"
+) else if /I "%~1"=="--types" (
+  set "WANT_TYPEMODE=1"
 ) else if /I "%~1"=="--force" (
   set "AI_DIFF_FORCE=1"
 ) else if /I "%~1"=="--outdir" (
@@ -114,6 +129,14 @@ goto :parse_args
 if defined WANT_OUTDIR (
   echo [ERROR] --outdir needs a directory after it.
   goto :usage
+)
+if defined WANT_TYPEMODE (
+  echo [ERROR] --types needs "all" or "missing" after it.
+  goto :usage
+)
+if /I not "%PORT_TYPES%"=="all" if /I not "%PORT_TYPES%"=="missing" if not "%PORT_TYPES%"=="0" (
+  echo [ERROR] PORT_TYPES must be "all", "missing" or "0", not "%PORT_TYPES%".
+  exit /b 1
 )
 if not defined NEW_IDB goto :usage
 
@@ -175,8 +198,9 @@ set "TS=%RANDOM%%RANDOM%"
 set "TMPDIR=%TEMP%\diaphora_run_%TS%"
 mkdir "%TMPDIR%" 2>nul
 for %%A in ("%TMPDIR%") do set "TMPDIR=%%~sA"
-echo "%TMPDIR%" | findstr /c:" " >nul
-if not errorlevel 1 (
+rem A substitution test, not `echo | findstr`: cmd counts the space before the
+rem pipe as part of what is echoed, so that test always reports a space.
+if not "%TMPDIR%"=="%TMPDIR: =%" (
   rd /s /q "%TMPDIR%" 2>nul
   set "TMPDIR=%SystemDrive%\diaphora_run_%TS%"
   mkdir "!TMPDIR!" 2>nul
@@ -186,13 +210,36 @@ if not exist "%TMPDIR%" (
   exit /b 1
 )
 
+rem ---- work on a copy of the OLD database ------------------------------------
+rem Nothing here means to change the old database, but opening one is not free:
+rem IDA rewrites the .i64 container every time it closes one, and the exporting
+rem step decompiles every function, which Hex-Rays caches inside the database
+rem (measured: 842 KB grew to 1.6 MB on the first export). The old database is
+rem usually the one holding analysis that cannot be reproduced, so by default
+rem it is copied into the scratch directory and never opened at all.
+set "OLD_ORIG=%OLD_IDB%"
+if "%PROTECT_OLD%"=="1" (
+  for %%A in ("%OLD_IDB%") do set "OLD_COPY=%TMPDIR%\old_source%%~xA"
+  echo [INFO] Copying the OLD database so it is never opened:
+  echo        !OLD_COPY!
+  copy /y "%OLD_IDB%" "!OLD_COPY!" >nul
+  if errorlevel 1 (
+    echo [ERROR] Could not copy the OLD database. Pass --no-protect-old to
+    echo         work on it directly, or free up space in %TEMP%.
+    rd /s /q "%TMPDIR%" 2>nul
+    exit /b 1
+  )
+  set "OLD_IDB=!OLD_COPY!"
+)
+
 rem ---- where the exports live ------------------------------------------------
 rem With --ai they are deliverables the summary points at, so they go next to
 rem the export and stay. Otherwise they are throwaway intermediates.
+rem Named after the original old database, not the working copy.
 if defined DO_AI (
   for %%A in ("%NEW_IDB%") do set "NEW_DIR=%%~dpA"
   for %%A in ("%NEW_IDB%") do set "NEW_STEM=%%~nA"
-  for %%A in ("%OLD_IDB%") do set "OLD_STEM=%%~nA"
+  for %%A in ("%OLD_ORIG%") do set "OLD_STEM=%%~nA"
 )
 if defined DO_AI if not defined OUTDIR (
   set "OUTDIR=!NEW_DIR!!NEW_STEM!_vs_!OLD_STEM!.aidiff"
@@ -217,8 +264,13 @@ if not defined DO_AI (
 set "OLD_SQLITE=%DBDIR%\old.sqlite"
 set "NEW_SQLITE=%DBDIR%\new.sqlite"
 set "RESULTS_SQLITE=%DBDIR%\results.sqlite"
+rem These four go through IDA's -S switch, which splits on whitespace, so they
+rem live in the space free scratch directory. The report is copied out at the end.
 set "FOLDERS_JSON=%TMPDIR%\folders.json"
-set "LOG_FOLDERS=%LOGDIR%\folders.log"
+set "LVARS_JSON=%TMPDIR%\lvars.json"
+set "TYPES_JSON=%TMPDIR%\types.json"
+set "PORT_REPORT=%TMPDIR%\port_report.json"
+set "LOG_DUMP=%LOGDIR%\dump_old.log"
 set "LOG_EXPORT_OLD=%LOGDIR%\export_old.log"
 set "LOG_EXPORT_NEW=%LOGDIR%\export_new.log"
 set "LOG_DIFF=%LOGDIR%\diff.log"
@@ -227,17 +279,18 @@ set "LOG_IMPORT=%LOGDIR%\import.log"
 rem ---- step budget -----------------------------------------------------------
 rem Exporting both sides and diffing them is always needed; the rest depends
 rem on which halves were asked for.
+rem Porting adds two: the dump from the OLD database, and the import itself.
 set /a TOTAL=3
-if defined DO_PORT set /a TOTAL+=1
-if defined DO_PORT if "%PORT_FOLDERS%"=="1" set /a TOTAL+=1
+if defined DO_PORT set /a TOTAL+=2
 if defined DO_AI set /a TOTAL+=1
 set "STEP_NO=0"
 set "FAIL_AI="
 set "FAIL_PORT="
+set "ABORT="
 
-echo [INFO] Old database: %OLD_IDB%
+echo [INFO] Old database: %OLD_ORIG%
 echo [INFO] New database: %NEW_IDB%
-if defined DO_PORT echo [INFO] Porting:      names / comments / prototypes / types / folders
+if defined DO_PORT echo [INFO] Porting:      names / prototypes / comments / types ^(%PORT_TYPES%^) / globals / lvars / folders
 if defined DO_AI echo [INFO] AI export:    %OUTDIR%
 echo [INFO] Scratch:      %TMPDIR%
 
@@ -255,29 +308,27 @@ if defined DO_PORT (
   )
 )
 
-rem ---- dump the function folder layout of the OLD database -------------------
+rem ---- dump what Diaphora's exporter leaves behind, from the OLD database ----
+rem The folder layout, the Hex-Rays local variables, and the types. All three
+rem are cheap -- a tree walk, a netnode read and a type library read, none of
+rem them decompiles -- so all three are always dumped and PORT_FOLDERS /
+rem PORT_LVARS / PORT_TYPES only decide what gets applied.
+rem
 rem This only reads the OLD database: the dump script ends with qexit(), which
 rem does not save, exactly like the export steps below. (IDA does rewrite the
 rem .i64 container on close, so its timestamp changes, but its contents do
-rem not.) A failure here is not fatal, we simply port everything but the
-rem folders.
+rem not.) A failure here is not fatal, we simply port everything else.
 set "FOLDERS_ARG="
-if defined DO_PORT if "%PORT_FOLDERS%"=="1" (
-  call :step "Dumping function folders from OLD database..."
-  "%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_folders.py %FOLDERS_JSON%" -L"%LOG_FOLDERS%" "%OLD_IDB%"
-  if exist "%FOLDERS_JSON%.ok" (
-    set "FOLDERS_ARG= %FOLDERS_JSON%"
-    for /f "usebackq delims=" %%L in ("%FOLDERS_JSON%.ok") do echo        %%L
-  ) else (
-    echo [WARN] Could not dump the function folders, continuing without them.
-    if exist "%FOLDERS_JSON%.fail" type "%FOLDERS_JSON%.fail"
-  )
-)
+set "LVARS_ARG="
+set "TYPES_ARG="
+if defined DO_PORT call :dump_old
+if defined ABORT goto :abort
 
 rem ---- export OLD ------------------------------------------------------------
 rem The OLD database is never modified by us, so a previous export of it is
 rem always safe to reuse.
 set "DO_EXPORT=1"
+set "IDA_RC=0"
 if defined DO_AI call :needs_export "%OLD_SQLITE%" DO_EXPORT
 if "%DO_EXPORT%"=="0" (
   call :skipstep "Reusing db\old.sqlite, pass --force to export it again"
@@ -287,9 +338,10 @@ if "%DO_EXPORT%"=="0" (
   set "DIAPHORA_AUTO=1"
   set "DIAPHORA_EXPORT_FILE=%OLD_SQLITE%"
   "%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_ida.py" -L"%LOG_EXPORT_OLD%" "%OLD_IDB%"
+  set "IDA_RC=!errorlevel!"
 )
 if not exist "%OLD_SQLITE%" (
-  echo [ERROR] Export of OLD database failed, log follows:
+  echo [ERROR] Export of OLD database failed, IDA exit code %IDA_RC%. Log follows:
   if exist "%LOG_EXPORT_OLD%" type "%LOG_EXPORT_OLD%"
   goto :abort
 )
@@ -299,6 +351,7 @@ rem Never reused when porting: a cached new.sqlite may be one a previous import
 rem rewrote, which would both inflate the ratios and make import_all_auto skip
 rem the functions it is supposed to rename (it only takes sub_* ones).
 set "DO_EXPORT=1"
+set "IDA_RC=0"
 if defined DO_AI if not defined DO_PORT call :needs_export "%NEW_SQLITE%" DO_EXPORT
 if "%DO_EXPORT%"=="0" (
   call :skipstep "Reusing db\new.sqlite, pass --force to export it again"
@@ -308,6 +361,7 @@ if "%DO_EXPORT%"=="0" (
   set "DIAPHORA_AUTO=1"
   set "DIAPHORA_EXPORT_FILE=%NEW_SQLITE%"
   "%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_ida.py" -L"%LOG_EXPORT_NEW%" "%NEW_IDB%"
+  set "IDA_RC=!errorlevel!"
 )
 rem diaphora_ida.py runs its exporting branch whenever DIAPHORA_AUTO is set, and
 rem diaphora_auto_import.py imports it, so these must be gone before the import.
@@ -315,7 +369,7 @@ set "DIAPHORA_AUTO="
 set "DIAPHORA_EXPORT_FILE="
 set "DIAPHORA_USE_DECOMPILER="
 if not exist "%NEW_SQLITE%" (
-  echo [ERROR] Export of NEW database failed, log follows:
+  echo [ERROR] Export of NEW database failed, IDA exit code %IDA_RC%. Log follows:
   if exist "%LOG_EXPORT_NEW%" type "%LOG_EXPORT_NEW%"
   goto :abort
 )
@@ -331,8 +385,16 @@ if not exist "%RESULTS_SQLITE%" (
   goto :abort
 )
 
+rem ---- import everything into the NEW idb, in place --------------------------
+rem Before the AI export on purpose: the import updates db\new.sqlite with the
+rem ported state of every function it touched, so the export that follows reads
+rem pseudo-code whose names and types match the old database. Without that, an
+rem unchanged function still diffs as "status" against "v4".
+if defined DO_PORT call :do_import
+
 rem ---- render the results for an AI agent ------------------------------------
-rem Deliberately before the porting step, see the header.
+rem Runs even when the import failed: the analysis is the expensive part and is
+rem worth keeping, it just describes the un-ported database in that case.
 if defined DO_AI (
   call :step "Writing the AI-readable export..."
   "%PYTHON_EXE%" "%DIAPHORA_DIR%\diaphora_ai_export.py" ^
@@ -346,15 +408,27 @@ if defined DO_AI (
   )
 )
 
-rem ---- import everything into the NEW idb, in place --------------------------
-if defined DO_PORT call :do_import
+rem The report is written in the scratch directory, which goes away: keep it
+rem with the rest of the output, or beside the database it describes when there
+rem is no output directory.
+set "REPORT_KEPT="
+if defined DO_PORT if exist "%PORT_REPORT%" (
+  if defined DO_AI (
+    set "REPORT_KEPT=!OUTDIR!\port_report.json"
+  ) else (
+    set "REPORT_KEPT=!NEW_IDB!.port_report.json"
+  )
+  copy /y "%PORT_REPORT%" "!REPORT_KEPT!" >nul 2>&1
+)
 
 rem ---- report ----------------------------------------------------------------
 echo.
 if defined DO_AI if not defined FAIL_AI echo [OK] AI export written, start from %OUTDIR%\summary.md
+if defined DO_AI if not defined FAIL_AI if defined FAIL_PORT echo [WARN] That export describes the database as it was BEFORE the port, which failed.
 if defined DO_AI if defined FAIL_AI echo [FAIL] The AI export could not be written.
 if defined DO_PORT if not defined FAIL_PORT echo [OK] %NEW_IDB% has been updated in place.
 if defined DO_PORT if not defined FAIL_PORT echo [OK] Backup of the pre-import state kept at %BACKUP%
+if defined REPORT_KEPT echo [OK] What the port carried over: %REPORT_KEPT%
 if defined DO_PORT if defined FAIL_PORT echo [FAIL] Porting failed, %NEW_IDB% is unchanged beyond its backup at %BACKUP%
 
 call :cleanup
@@ -373,43 +447,109 @@ if defined BACKUP (
 exit /b 1
 
 rem =============================================================================
-:do_import
-rem IDA splits -S on whitespace, so the paths handed to the import script must
-rem be space free -- and they must not be the deliverables either, because
-rem Diaphora's import rewrites the rows of every function it touches in the
-rem primary database (reinit() makes main_db the primary, and import_items()
-rem re-reads and re-saves each one). Copies in the scratch directory solve both
-rem at once and leave db\new.sqlite exactly as it was diffed.
-set "IMP_OLD=%OLD_SQLITE%"
-set "IMP_NEW=%NEW_SQLITE%"
-set "IMP_RESULTS=%RESULTS_SQLITE%"
-if defined DO_AI (
-  set "IMP_OLD=%TMPDIR%\imp_old.sqlite"
-  set "IMP_NEW=%TMPDIR%\imp_new.sqlite"
-  set "IMP_RESULTS=%TMPDIR%\imp_results.sqlite"
-  copy /y "%OLD_SQLITE%" "!IMP_OLD!" >nul
-  copy /y "%NEW_SQLITE%" "!IMP_NEW!" >nul
-  copy /y "%RESULTS_SQLITE%" "!IMP_RESULTS!" >nul
-  if errorlevel 1 (
-    echo [ERROR] Could not copy the exports into the scratch directory.
-    set "FAIL_PORT=1"
-    exit /b 0
-  )
+:dump_old
+call :step "Dumping folders, local variables and types from OLD database..."
+"%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_analysis.py folders=%FOLDERS_JSON% lvars=%LVARS_JSON% types=%TYPES_JSON%" -L"%LOG_DUMP%" "%OLD_IDB%"
+rem The dump script swallows its own errors and still exits 0, so a non-zero
+rem code here means IDA itself could not open the database. Stop now instead of
+rem carrying on to the export: opening a database that just failed to open is
+rem how IDA ends up creating an empty one over it.
+if not "%errorlevel%"=="0" (
+  echo [ERROR] IDA could not open the OLD database ^(exit code %errorlevel%^).
+  echo         Not touching it again. Log:
+  if exist "%LOG_DUMP%" type "%LOG_DUMP%"
+  set "ABORT=1"
+  exit /b 0
 )
 
-call :step "Importing names / comments / prototypes / structs / enums / unions / typedefs / folders into NEW database..."
-"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py %IMP_RESULTS% %IMP_NEW% %IMP_OLD%%FOLDERS_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
+if "%PORT_FOLDERS%"=="1" (
+  if exist "%FOLDERS_JSON%.ok" (
+    set "FOLDERS_ARG= folders=%FOLDERS_JSON%"
+    for /f "usebackq delims=" %%L in ("%FOLDERS_JSON%.ok") do echo        folders: %%L
+  ) else (
+    echo [WARN] Could not dump the function folders, continuing without them.
+    if exist "%FOLDERS_JSON%.fail" type "%FOLDERS_JSON%.fail"
+  )
+) else (
+  echo        folders: skipped ^(PORT_FOLDERS=%PORT_FOLDERS%^)
+)
 
-if exist "%IMP_RESULTS%.ok" (
-  for /f "usebackq delims=" %%L in ("%IMP_RESULTS%.ok") do echo        %%L
+if "%PORT_LVARS%"=="1" (
+  if exist "%LVARS_JSON%.ok" (
+    set "LVARS_ARG= lvars=%LVARS_JSON%"
+    for /f "usebackq delims=" %%L in ("%LVARS_JSON%.ok") do echo        lvars:   %%L
+  ) else (
+    echo [WARN] Could not dump the local variables, continuing without them.
+    if exist "%LVARS_JSON%.fail" type "%LVARS_JSON%.fail"
+  )
+) else (
+  echo        lvars:   skipped ^(PORT_LVARS=%PORT_LVARS%^)
+)
+
+if not "%PORT_TYPES%"=="0" (
+  if exist "%TYPES_JSON%.ok" (
+    set "TYPES_ARG= types=%TYPES_JSON% typemode=%PORT_TYPES%"
+    for /f "usebackq delims=" %%L in ("%TYPES_JSON%.ok") do echo        types:   %%L ^(mode %PORT_TYPES%^)
+  ) else (
+    echo [WARN] Could not dump the types, falling back to Diaphora's own C text path.
+    if exist "%TYPES_JSON%.fail" type "%TYPES_JSON%.fail"
+  )
+) else (
+  echo        types:   skipped, Diaphora's own C text path will be used
+)
+exit /b 0
+
+rem =============================================================================
+:do_import
+rem IDA splits -S on whitespace, so the three database paths handed to the
+rem import script must be space free. They must also be the real files, not
+rem copies: the import updates main.sqlite with the ported state of every
+rem function it touched, and the AI export reads that afterwards. So instead
+rem of copying, pass the 8.3 short form of each path, which names the same
+rem file without spaces.
+call :short_path "%RESULTS_SQLITE%" S_RESULTS
+call :short_path "%NEW_SQLITE%" S_NEW
+call :short_path "%OLD_SQLITE%" S_OLD
+rem One substitution test over all three: it is a no-op unless one has a space.
+set "_PATHS=!S_RESULTS!;!S_NEW!;!S_OLD!"
+if not "!_PATHS!"=="!_PATHS: =!" (
+  echo [ERROR] These paths still contain a space in their 8.3 form, so IDA cannot
+  echo         be told about them:
+  echo         !_PATHS!
+  echo         8.3 names are probably disabled on that volume. Re-run with
+  echo         --outdir pointing somewhere without spaces.
+  set "_PATHS="
+  set "FAIL_PORT=1"
+  exit /b 0
+)
+set "_PATHS="
+
+call :step "Importing names / prototypes / comments / types / globals / lvars / folders into NEW database..."
+"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py results=!S_RESULTS! main=!S_NEW! diff=!S_OLD! report=%PORT_REPORT%%FOLDERS_ARG%%LVARS_ARG%%TYPES_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
+
+rem The marker files land next to the path the script was given, which is the
+rem 8.3 one -- and "results.sqlite" does not survive 8.3 unchanged, so looking
+rem for them under the long name would never find them.
+if exist "!S_RESULTS!.ok" (
+  for /f "usebackq delims=" %%L in ("!S_RESULTS!.ok") do echo        %%L
+  del /q "!S_RESULTS!.ok" >nul 2>&1
   exit /b 0
 )
 
 echo [ERROR] Import failed:
-if exist "%IMP_RESULTS%.fail" type "%IMP_RESULTS%.fail"
+if exist "!S_RESULTS!.fail" type "!S_RESULTS!.fail"
 echo [ERROR] IDA log follows:
 if exist "%LOG_IMPORT%" type "%LOG_IMPORT%"
+del /q "!S_RESULTS!.fail" >nul 2>&1
 set "FAIL_PORT=1"
+exit /b 0
+
+rem =============================================================================
+:short_path
+rem %1 = an existing path, %2 = variable receiving its 8.3 short form.
+rem %%~s only resolves for a file that exists, which is the case for all three
+rem databases by the time the import runs.
+for %%A in ("%~1") do set "%2=%%~sA"
 exit /b 0
 
 rem =============================================================================
@@ -498,6 +638,12 @@ echo   --ai           write the AI export only
 echo   --outdir DIR   where the AI export goes
 echo                  ^(default: ^<new^>_vs_^<old^>.aidiff next to the new database^)
 echo   --no-folders   do not port the function folder layout
+echo   --no-lvars     do not port the Hex-Rays local variables
+echo   --types MODE   "all" to replace a type the new database already has,
+echo                  "missing" to only fill in what is absent ^(default: all^)
+echo   --no-types     leave the types to Diaphora's own C text path
+echo   --no-protect-old  read the OLD database directly instead of a copy
+echo                  ^(the copy exists because opening a database rewrites it^)
 echo   --force        export again even when a previous export is there
 echo   -h, --help     this text
 echo.

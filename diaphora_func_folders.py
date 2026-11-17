@@ -10,7 +10,7 @@ database is lost. This module dumps that tree to a JSON file from one
 database and re-applies it to another one, matching functions by name.
 
 Both halves must run inside IDA (they use the ida_dirtree API). The dumping
-side is driven by diaphora_dump_folders.py, the applying side by
+side is driven by diaphora_dump_analysis.py, the applying side by
 diaphora_auto_import.py.
 
 Folders live in a dirtree_t whose inodes are the functions' start addresses

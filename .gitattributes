@@ -1,0 +1,5 @@
+# Batch files must keep CRLF line endings in the working tree. With LF only,
+# cmd mis-seeks and a `goto` from inside a parenthesised block fails with
+# "The system cannot find the batch label specified" once the file is big
+# enough -- which is a confusing way to find out.
+*.bat text eol=crlf

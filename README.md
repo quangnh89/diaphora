@@ -121,10 +121,20 @@ databases. It drives IDA in batch mode and needs no interaction.
 
 It produces two things, and does both by default:
 
-**Porting** copies function names, function and instruction comments,
-prototypes, struct/enum/union/typedef definitions, and the Functions window
-folder layout from the old database into the new one. The new database is
-modified in place, after a backup of it is made and kept.
+**Porting** copies function names, prototypes, function and instruction
+comments, pseudo-code comments, struct/enum/union/typedef definitions, global
+variable names and types, the Hex-Rays local variables (function arguments
+included) and the Functions window folder layout from the old database into
+the new one. The new database is modified in place, after a backup of it is
+made and kept. `port_report.json` says how much of each actually went across.
+
+Types — the local type definitions and the function prototypes — are
+transferred in IDA's own serialized form rather than printed as C and parsed
+back. That round trip is lossy: on a real pair of builds it dropped 155 of
+2181 types, truncated every struct that had one of those as a member, and
+took 378 prototypes down with it. Some of it cannot work at all that way,
+since IDA prints a shifted pointer as `X *__shifted(Y,0x80)` and its own
+parser will not read that back.
 
 **The AI export** writes the diffing result as plain text an AI agent can read
 directly: the matched and unmatched tables as JSONL, a unified diff of the
@@ -138,6 +148,10 @@ databases for SQL queries.
 | `--ai` | AI export only |
 | `--outdir DIR` | Where the AI export goes. Default: `<new>_vs_<old>.aidiff` next to the new database |
 | `--no-folders` | Do not port the function folder layout |
+| `--no-lvars` | Do not port the Hex-Rays local variables |
+| `--types all` \| `missing` | Replace a type the new database already has, or only fill in what is absent. Default `all` |
+| `--no-types` | Leave the types to Diaphora's own C text path |
+| `--no-protect-old` | Read the old database directly instead of a scratch copy |
 | `--force` | Export again even when a previous export is there |
 | `-h`, `--help` | Usage |
 
@@ -154,29 +168,93 @@ halves from it. Running the two halves as separate commands would export four
 times and diff twice. Do not run two copies in parallel against the same
 database either: IDA locks it.
 
-The AI export is written **before** the porting step, so it describes the two
-databases exactly as they were diffed: honest similarity ratios, and the names
-each side had at diff time. That means the new side of a diff still reads
-`sub_140012340`; `matches.jsonl` pairs it with the old name, so nothing is
-lost. As a side effect the export survives a failing import.
+The AI export is written **after** the porting step, and reads the ported
+state. That matters more than it sounds: without it, an unchanged function
+still diffs as `status` against `v4` and `HV_VP_CONTEXT *ctx` against
+`__int64 a1`, purely because the analysis lives in the old database only. Once
+the names, prototypes, types and local variables are across, both sides of the
+pseudo-code read the same and what is left in the diff is the change itself.
 
-If you would rather have the diffs themselves labelled with the ported names —
-`old/CheckAccessToken` against `new/CheckAccessToken`, with both sides of the
-pseudo-code using the same variable and struct names, leaving only the real
-change in the diff — port first and then export against the ported database:
+The ratio in `matches.jsonl` is still the one measured while diffing, before
+the port, so it is not inflated by the porting itself. The diff bodies are the
+ported ones. `summary.md` repeats this where it matters.
 
-    diaphora_run.bat D:\work\old\module.i64 D:\work\new\module.i64 --port
-    diaphora_run.bat D:\work\old\module.i64 D:\work\new\module.i64 --ai --force
+## Did the code change, or only the way it reads?
 
-That costs one extra export of the new database, and the ratios it reports are
-inflated, because porting the symbols is itself what made the two sides look
-alike.
+Every match carries `code_changed` and the `code` verdict behind it:
 
-One thing to watch out for either way: porting imports every match at or above
-`DIAPHORA_MINIMUM_IMPORT_RATIO` (`0.5`), so a bad match can put a wrong name
-into the new database. Two builds off the same branch are close enough for the
-default; raise it to `0.7` or so when the builds are further apart, for
-instance built with a different compiler.
+| `code` | Means |
+|---|---|
+| `same-bytes` | Identical instruction bytes. Proof. |
+| `same-asm` | Identical normalised disassembly: symbol names and addresses become placeholders, registers and immediate values are kept. |
+| `same-asm-renamed-stack` | Identical once the stack frame member names are masked too. Weaker — see below. |
+| `changed` | The instructions differ. |
+
+The per-function diffs are split on it:
+
+- `changed/` — the instructions differ. Each diff has an `.asm.diff` beside it
+  showing the machine level change, down to a single `add rdi, 8` becoming
+  `add rdi, 9`.
+- `cosmetic/` — same instructions, different rendering: a name, a type, a local
+  variable or a struct field that exists on one side only.
+
+`same-asm-renamed-stack` exists because stack frame member names are not
+ported: a slot the old database calls `gpaOut` is still `arg_18` in the new
+one, and that alone made 274 unchanged functions out of 4611 read as changed
+on a real pair of builds. Masking those names is weaker than `same-asm`,
+since it cannot tell two different stack slots apart — though Diaphora's own
+normaliser has already replaced the numeric part of the operand (`+48h+` ->
+`+XXXX+`), so the name was the only thing distinguishing them to begin with.
+
+Deliberately not based on the `mnemonics` column: that one drops the operands,
+so it cannot tell `mov eax` from `mov ecx` and would hide a real change.
+
+## Things to watch out for
+
+Porting imports every match at or above `DIAPHORA_MINIMUM_IMPORT_RATIO`
+(`0.5`), so a bad match can put a wrong name into the new database. Two builds
+off the same branch are close enough for the default; raise it to `0.7` or so
+when the builds are further apart, for instance built with a different
+compiler.
+
+A function the new database already named itself keeps that name when it
+differs from the old one — a fresh symbol beats a stale guess. Everything else
+about it is still ported. `names_kept` in the report counts those.
+
+Local variables cannot be copied across as they are: Hex-Rays identifies a
+saved variable by its location plus `defea`, the address of the instruction
+that defines it, and that address is different in every build. They are
+matched instead on the location plus `defea` measured from the start of the
+function, which is the same in both builds for as long as the body is, and on
+the location alone as a fallback. The location alone is not enough on its own:
+a stack slot is unique within a function but a register is not, and several
+variables sharing one register is the common case — on a real database that
+distinction was the difference between 10007 and 22285 variables carried over.
+Where neither key gives a single answer the variable is left alone and counted
+in `lvars.vars_skipped`, never guessed at.
+
+A name already taken by another variable of the same function is the other
+reason a rename fails. When the variable in the way only carries a name
+Hex-Rays made up (`v12`, `a3`) it is moved aside so the real name can land
+(`lvars.names_unblocked`); a name you chose yourself is never touched, and
+those cases are counted in `lvars.collision_user_named` with examples.
+
+Porting local variables means decompiling the functions that have any, and the
+step that writes the ported state back into `db/new.sqlite` decompiles the
+matched functions once more, so a big database spends real time there.
+`--no-lvars` skips it.
+
+The old database is copied into the scratch directory and the original is
+never opened, so it comes out of a run byte for byte identical. That is not
+paranoia: IDA rewrites the `.i64` container whenever it closes one, and the
+exporting step decompiles every function, which Hex-Rays caches *inside* the
+database — a small sample grew from 842 KB to 1.6 MB on its first export.
+Since the old database is usually the one holding analysis that cannot be
+reproduced, it is left alone by default. `--no-protect-old` skips the copy.
+
+If a step cannot open a database, the run stops there rather than carrying on
+to the next one. Opening a database that just failed to open is how IDA ends
+up creating an empty one over it.
 
 ## Configuration
 
@@ -195,6 +273,9 @@ key; this is the full list:
 | `PYTHON_EXE` | both halves | `python` | Python 3 for the diffing and exporting steps, which need no IDA |
 | `USE_DECOMPILER` | both halves | `1` | `0` exports without Hex-Rays: much faster, but the diffs then show assembly instead of pseudo-code |
 | `PORT_FOLDERS` | `--port` | `1` | `0` skips porting the function folder layout, same as `--no-folders` |
+| `PORT_LVARS` | `--port` | `1` | `0` skips porting the Hex-Rays local variables, same as `--no-lvars` |
+| `PORT_TYPES` | `--port` | `all` | `missing` only fills in absent types, `0` leaves them to Diaphora's C text path |
+| `PROTECT_OLD` | both halves | `1` | `0` reads the old database directly instead of a scratch copy |
 | `DIAPHORA_MINIMUM_IMPORT_RATIO` | `--port` | `0.5` | Similarity a match needs before it is imported |
 | `AI_DIFF_MAX_DIFFS` | `--ai` | `2000` | Cap on the number of per-function `.diff` files, lowest ratio first |
 | `AI_DIFF_CONTEXT` | `--ai` | `3` | Context lines in those diffs |

@@ -108,18 +108,25 @@ def program_info(db):
   return info
 
 
-def function_body(db, address):
+def function_row(db, address):
+  """
+  Everything this exporter needs about one function, or None.
+  """
+  return db.execute(
+    "select prototype, pseudocode, assembly, clean_assembly, bytes_hash"
+    " from functions where address = ?",
+    (hex_to_decimal(address),),
+  ).fetchone()
+
+
+def function_body(row):
   """
   The text a function is diffed as: its prototype followed by its
   pseudo-code, or by its assembly when the database was exported without a
   decompiler.
 
-  Returns a (text, kind) tuple, both None when the function is unknown.
+  Returns a (text, kind) tuple, both None when there is nothing to diff.
   """
-  row = db.execute(
-    "select prototype, pseudocode, assembly from functions where address = ?",
-    (hex_to_decimal(address),),
-  ).fetchone()
   if row is None:
     return None, None
 
@@ -130,6 +137,65 @@ def function_body(db, address):
       return "\n".join(parts), kind
 
   return None, None
+
+
+def code_row(db, address):
+  """
+  Just the two columns the machine level verdict needs.
+  """
+  return db.execute(
+    "select clean_assembly, bytes_hash from functions where address = ?",
+    (hex_to_decimal(address),),
+  ).fetchone()
+
+
+# A stack operand that survived Diaphora's normaliser as "[rsp+XXXX+name]".
+_STACK_MEMBER = re.compile(r"\+[A-Za-z_][A-Za-z0-9_]*\]")
+
+# Verdicts that mean the instructions are the same, strongest first.
+SAME_CODE = ("same-bytes", "same-asm", "same-asm-renamed-stack")
+
+
+def code_verdict(new_row, old_row):
+  """
+  Did the machine code change, independently of how it is rendered? One of:
+
+    same-bytes   identical instruction bytes. Proof.
+    same-asm     identical normalised disassembly. `clean_assembly` is
+                 Diaphora's own (CBinDiff.get_cmp_asm): comments gone,
+                 sub_/qword_/loc_/... names and addresses replaced by
+                 placeholders, registers and immediate values kept.
+    same-asm-renamed-stack
+                 identical once the names of the stack frame members are
+                 masked too. Those are not ported -- a slot the old database
+                 calls `gpaOut` is still `arg_18` here -- so without this
+                 an unchanged function reads as changed. Weaker than
+                 same-asm: it cannot tell two different stack slots apart.
+                 Note that get_cmp_asm has already replaced the numeric part
+                 of the operand ("+48h+" -> "+XXXX+"), so the name was the
+                 only thing left distinguishing them in the first place.
+    changed      the instructions differ.
+    unknown      one side was not exported.
+
+  Deliberately NOT based on the `mnemonics` column: that one is the list of
+  mnemonics alone, with the operands dropped, so it cannot tell `mov eax`
+  from `mov ecx` and would hide a real change.
+  """
+  if new_row is None or old_row is None:
+    return "unknown"
+
+  if new_row["bytes_hash"] and new_row["bytes_hash"] == old_row["bytes_hash"]:
+    return "same-bytes"
+
+  new_asm = new_row["clean_assembly"]
+  old_asm = old_row["clean_assembly"]
+  if not new_asm or not old_asm:
+    return "unknown"
+  if new_asm == old_asm:
+    return "same-asm"
+  if _STACK_MEMBER.sub("+VAR]", new_asm) == _STACK_MEMBER.sub("+VAR]", old_asm):
+    return "same-asm-renamed-stack"
+  return "changed"
 
 
 def read_matches(results, min_ratio):
@@ -192,23 +258,70 @@ def read_unmatched(results):
   return only_new, only_old
 
 
+def classify_matches(matches, new_db, old_db):
+  """
+  Answer "did the machine code change" for every match, including the ones
+  that need no diff, so that a consumer can filter on it without having to
+  reason about ratios.
+  """
+  for match in matches:
+    verdict = code_verdict(
+      code_row(new_db, match["_address"]),
+      code_row(old_db, match["_address2"]),
+    )
+    match["code"] = verdict
+    match["code_changed"] = verdict not in SAME_CODE
+
+
+def _unified(old_text, new_text, old_label, new_label, context):
+  return list(
+    difflib.unified_diff(
+      old_text.splitlines(),
+      new_text.splitlines(),
+      fromfile="old/%s" % old_label,
+      tofile="new/%s" % new_label,
+      n=context,
+      lineterm="",
+    )
+  )
+
+
+def _write_text(path, lines):
+  with open(path, "w", encoding="utf8", newline="\n") as fh:
+    fh.write("\n".join(lines))
+    fh.write("\n")
+
+
+def _clear_diffs(directory):
+  # Re-running with other options yields a different set of files, and the
+  # numbering shifts. Drop the previous ones, so that nothing is left behind
+  # that index.jsonl does not account for.
+  if not os.path.isdir(directory):
+    return
+  for stale in os.listdir(directory):
+    if stale.endswith(".diff"):
+      os.remove(os.path.join(directory, stale))
+
+
 def write_diffs(matches, new_db, old_db, outdir, max_diffs, context):
   """
   Write a unified diff per changed function, most changed first so that the
   --max-diffs budget is spent where it matters.
 
-  Mutates the matches in place to record the diff file each one got, and
-  returns a dict of counts.
+  Functions whose instructions are unchanged go to cosmetic/ instead of
+  changed/, so that changed/ means what it says. The ones that did change
+  also get a diff of the normalised assembly next to the pseudo-code one:
+  the question is always "did the code change" before "how does it read".
+
+  Mutates the matches in place to record the verdict and the diff file each
+  one got, and returns a dict of counts.
   """
   changed_dir = os.path.join(outdir, "changed")
+  cosmetic_dir = os.path.join(outdir, "cosmetic")
   os.makedirs(changed_dir, exist_ok=True)
-
-  # Re-running with other options yields a different set of files, and the
-  # numbering shifts. Drop the previous ones, so that nothing is left in
-  # changed/ that index.jsonl does not account for.
-  for stale in os.listdir(changed_dir):
-    if stale.endswith(".diff"):
-      os.remove(os.path.join(changed_dir, stale))
+  os.makedirs(cosmetic_dir, exist_ok=True)
+  _clear_diffs(changed_dir)
+  _clear_diffs(cosmetic_dir)
 
   candidates = sorted(
     (m for m in matches if not m["identical"]),
@@ -216,32 +329,31 @@ def write_diffs(matches, new_db, old_db, outdir, max_diffs, context):
   )
 
   written = 0
+  cosmetic = 0
   unchanged_body = 0
   no_body = 0
   budget_reached = False
   index_path = os.path.join(changed_dir, "index.jsonl")
-  with open(index_path, "w", encoding="utf8", newline="\n") as index:
+  cosmetic_index_path = os.path.join(cosmetic_dir, "index.jsonl")
+
+  with open(index_path, "w", encoding="utf8", newline="\n") as index, \
+       open(cosmetic_index_path, "w", encoding="utf8", newline="\n") as cosmetic_index:
     for match in candidates:
-      if written >= max_diffs:
+      if written + cosmetic >= max_diffs:
         budget_reached = True
         break
 
-      new_text, new_kind = function_body(new_db, match["_address"])
-      old_text, old_kind = function_body(old_db, match["_address2"])
+      new_row = function_row(new_db, match["_address"])
+      old_row = function_row(old_db, match["_address2"])
+      new_text, new_kind = function_body(new_row)
+      old_text, old_kind = function_body(old_row)
       if new_text is None or old_text is None:
         no_body += 1
         continue
 
-      lines = list(
-        difflib.unified_diff(
-          old_text.splitlines(),
-          new_text.splitlines(),
-          fromfile="old/%s" % match["old"]["name"],
-          tofile="new/%s" % match["new"]["name"],
-          n=context,
-          lineterm="",
-        )
-      )
+      old_label = match["old"]["name"]
+      new_label = match["new"]["name"]
+      lines = _unified(old_text, new_text, old_label, new_label, context)
       if not lines:
         # The ratio also accounts for features that are not part of the text
         # we diff here, so a changed function can still have an identical
@@ -250,33 +362,55 @@ def write_diffs(matches, new_db, old_db, outdir, max_diffs, context):
         unchanged_body += 1
         continue
 
-      relative = "changed/%05d_%s.diff" % (written + 1, safe_name(match["new"]["name"]))
-      with open(os.path.join(outdir, relative), "w", encoding="utf8", newline="\n") as fh:
-        fh.write("\n".join(lines))
-        fh.write("\n")
+      if match["code_changed"]:
+        bucket, number = "changed", written + 1
+      else:
+        bucket, number = "cosmetic", cosmetic + 1
 
+      relative = "%s/%05d_%s.diff" % (bucket, number, safe_name(new_label))
+      _write_text(os.path.join(outdir, relative), lines)
       match["diff_file"] = relative
       match["body"] = new_kind if new_kind == old_kind else f"{old_kind} -> {new_kind}"
-      written += 1
 
-      index.write(
-        json.dumps(
-          {
-            "diff_file": relative,
-            "type": match["type"],
-            "ratio": match["ratio"],
-            "heuristic": match["heuristic"],
-            "new_name": match["new"]["name"],
-            "old_name": match["old"]["name"],
-          },
-          ensure_ascii=False,
+      record = {
+        "diff_file": relative,
+        "type": match["type"],
+        "ratio": match["ratio"],
+        "heuristic": match["heuristic"],
+        "new_name": new_label,
+        "old_name": old_label,
+        "code": match["code"],
+      }
+
+      if not match["code_changed"]:
+        cosmetic += 1
+        cosmetic_index.write(json.dumps(record, ensure_ascii=False))
+        cosmetic_index.write("\n")
+      else:
+        # The instructions really differ: show them too, so the reader does
+        # not have to infer the machine level change from the pseudo-code.
+        asm_lines = _unified(
+          old_row["clean_assembly"] or "",
+          new_row["clean_assembly"] or "",
+          old_label,
+          new_label,
+          context,
         )
-      )
-      index.write("\n")
+        if asm_lines:
+          asm_relative = relative[: -len(".diff")] + ".asm.diff"
+          _write_text(os.path.join(outdir, asm_relative), asm_lines)
+          record["asm_diff_file"] = asm_relative
+          match["asm_diff_file"] = asm_relative
 
-  skipped = len(candidates) - written - unchanged_body - no_body if budget_reached else 0
+        written += 1
+        index.write(json.dumps(record, ensure_ascii=False))
+        index.write("\n")
+
+  accounted = written + cosmetic + unchanged_body + no_body
+  skipped = len(candidates) - accounted if budget_reached else 0
   return {
     "diffs_written": written,
+    "cosmetic": cosmetic,
     "diffs_skipped": max(0, skipped),
     "body_identical": unchanged_body,
     "body_missing": no_body,
@@ -316,6 +450,25 @@ def write_summary(path, ctx):
     "",
     "Every diff reads old -> new: `-` lines were removed, `+` lines were added.",
     "",
+    "## Did the code change, or only the way it reads?",
+    "",
+    "Every match carries `code_changed` and the `code` verdict behind it:",
+    "",
+    "| `code` | Means |",
+    "|---|---|",
+    "| `same-bytes` | Identical instruction bytes. Proof. |",
+    "| `same-asm` | Identical normalised disassembly: symbol names and addresses replaced by placeholders, registers and immediates kept. |",
+    "| `same-asm-renamed-stack` | Identical once the stack frame member names are masked too. Those are never ported, so a slot the old database calls `gpaOut` is still `arg_18` here. Weaker: it cannot tell two different stack slots apart. |",
+    "| `changed` | The instructions differ. |",
+    "",
+    "The per-function diffs are split on it:",
+    "",
+    "- `changed/` -- the instructions differ. Each one also has a `.asm.diff`",
+    "  next to it, so you can read the machine level change before the C.",
+    "- `cosmetic/` -- same instructions, different rendering: a name, a type, a",
+    "  local variable or a struct field that exists on one side only.",
+    "  **Start with `changed/`.**",
+    "",
     "## Counts",
     "",
     "| | |",
@@ -331,8 +484,13 @@ def write_summary(path, ctx):
     "| Identical (ratio 1.0) | %d |" % counts["identical"],
     "| Added (only in new) | %d |" % counts["only_new"],
     "| Removed (only in old) | %d |" % counts["only_old"],
-    "| Diff files written | %d |" % counts["diffs_written"],
+    "| Same instructions | %d |" % counts["same_code"],
+    "| Diff files written (code changed) | %d |" % counts["diffs_written"],
+    "| Cosmetic only | %d |" % counts["cosmetic"],
   ]
+  for verdict in SAME_CODE + ("changed", "unknown"):
+    if counts["by_code"].get(verdict):
+      lines.append("| &nbsp;&nbsp;`%s` | %d |" % (verdict, counts["by_code"][verdict]))
   if counts["diffs_skipped"]:
     lines.append("| Diffs skipped (--max-diffs) | %d |" % counts["diffs_skipped"])
   if counts["body_identical"]:
@@ -344,13 +502,16 @@ def write_summary(path, ctx):
     "",
     "## Files",
     "",
-    "- `matches.jsonl` -- one JSON object per match: type, ratio, heuristic, and the",
-    "  `new`/`old` address, name and basic-block count. `diff_file` points at the diff",
-    "  when there is one.",
+    "- `matches.jsonl` -- one JSON object per match: type, ratio, heuristic,",
+    "  `code`/`code_changed`, and the `new`/`old` address, name and",
+    "  basic-block count. `diff_file` points at the diff when there is one.",
     "- `unmatched_primary.jsonl` -- functions that exist only in the **new** binary.",
     "- `unmatched_secondary.jsonl` -- functions that exist only in the **old** binary.",
-    "- `changed/index.jsonl` -- the catalogue of diff files.",
+    "- `changed/index.jsonl`, `cosmetic/index.jsonl` -- the catalogue of each bucket.",
     "- `changed/*.diff` -- unified diff of the decompiled (or disassembled) function.",
+    "- `changed/*.asm.diff` -- the same function's normalised disassembly.",
+    "- `cosmetic/*.diff` -- functions whose instructions did not change.",
+    "- `port_report.json` -- what the porting step managed to carry over, when it ran.",
     "- `manifest.json` -- machine-readable version of everything on this page.",
     "- `db/*.sqlite` -- the raw Diaphora databases, for SQL queries the files above",
     "  do not answer. `results.results(type, address, name, address2, name2, ratio,",
@@ -361,12 +522,20 @@ def write_summary(path, ctx):
     "",
     "## Most changed functions",
     "",
+    "Only the ones whose instructions actually differ. The ratio was measured on",
+    "the databases as they were diffed; if the porting step ran afterwards, the",
+    "diff bodies below read with the ported names and types while the ratio does",
+    "not reflect that.",
+    "",
   ]
 
-  changed = [m for m in ctx["matches"] if m.get("diff_file")]
+  changed = [
+    m for m in ctx["matches"]
+    if m.get("diff_file") and m.get("code_changed")
+  ]
   changed.sort(key=lambda m: m["ratio"])
   if not changed:
-    lines.append("None: every match is identical.")
+    lines.append("None: no match differs at instruction level.")
   else:
     lines += [
       "| Ratio | New | Old | Heuristic | Diff |",
@@ -443,6 +612,7 @@ def main():
     matches = read_matches(results, args.min_ratio)
     only_new, only_old = read_unmatched(results)
 
+    classify_matches(matches, new_db, old_db)
     diff_counts = write_diffs(
       matches, new_db, old_db, args.outdir, args.max_diffs, args.context
     )
@@ -463,13 +633,18 @@ def main():
   write_jsonl(os.path.join(args.outdir, "unmatched_secondary.jsonl"), only_old)
 
   by_type = {}
+  by_code = {}
   for match in matches:
     by_type[match["type"]] = by_type.get(match["type"], 0) + 1
+    verdict = match.get("code", "unknown")
+    by_code[verdict] = by_code.get(verdict, 0) + 1
 
   counts = {
     "matches": len(matches),
     "by_type": by_type,
     "identical": sum(1 for m in matches if m["identical"]),
+    "same_code": sum(1 for m in matches if not m.get("code_changed")),
+    "by_code": by_code,
     "only_new": len(only_new),
     "only_old": len(only_old),
   }
