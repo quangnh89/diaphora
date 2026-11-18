@@ -22,8 +22,11 @@ Four things this does that Diaphora's own headless path does not:
    with them every struct member whose type was one of those -- plus the
    378 prototypes that named one. See diaphora_types.py.
 
-3. It ports the Functions window folder layout and the Hex-Rays local
-   variables, neither of which Diaphora touches.
+3. It ports the Functions window folder layout, the Hex-Rays local variables
+   and the stack frame member names and types, none of which Diaphora
+   touches. The frame members are the ones that show in the disassembly as
+   `[rsp+58h+flag]`, and they are a separate thing from the Hex-Rays local
+   variables that show in the pseudo-code -- see diaphora_frames.py.
 
 4. It writes a report saying what was and was not ported, instead of
    leaving the answer buried in IDA's log.
@@ -35,7 +38,8 @@ name and comment it just imported would be discarded on exit.
 Usage (run with idat/idat64 in batch/autonomous mode):
 
     idat64 -A -S"diaphora_auto_import.py results=<p> main=<p> diff=<p> \\
-                 folders=<p> lvars=<p> types=<p> report=<p> typemode=all" \\
+                 folders=<p> lvars=<p> types=<p> frames=<p> report=<p> \\
+                 typemode=all" \\
            -L<logfile> <target.i64>
 
 Arguments are name=value tokens in any order. IDA splits the -S string on
@@ -52,6 +56,7 @@ whitespace, so none of these paths may contain a space.
     folders   the folder layout dumped by diaphora_dump_analysis.py
     lvars     the local variables dumped by the same script
     types     the local and function types dumped by the same script
+    frames    the stack frame members dumped by the same script
     report    where to write the port report
     typemode  "all" to replace a type the target already has, "missing" to
               keep it and only fill in what is absent. Default "all".
@@ -334,6 +339,28 @@ def _apply_folders(folders_json):
     return {"status": f"failed: {traceback.format_exc(limit=0).strip()}"}
 
 
+def _apply_frames(frames_json, pairs):
+  """
+  The stack frame member names and types, which show up in the disassembly.
+  A different thing from the Hex-Rays local variables below, and the largest
+  single source of noise in the old database vs new database comparison.
+  """
+  if frames_json is None:
+    return {"status": "not requested"}
+  if not os.path.exists(frames_json):
+    return {"status": f"{frames_json} not found, skipped"}
+
+  try:
+    from diaphora_frames import apply_frames
+
+    counts = apply_frames(frames_json, pairs)
+    counts["status"] = "ok"
+    return counts
+  except Exception:
+    traceback.print_exc()
+    return {"status": f"failed: {traceback.format_exc(limit=0).strip()}"}
+
+
 def _apply_lvars(lvars_json, pairs):
   if lvars_json is None:
     return {"status": "not requested"}
@@ -413,6 +440,7 @@ def _summary_line(report):
   counts = report["functions"]
   local_types = report["local_types"]
   func_types = report["function_types"]
+  frames = report.get("frames", {})
   lvars = report["lvars"]
   folders = report["folders"]
   parts = [
@@ -427,6 +455,11 @@ def _summary_line(report):
     )
   if func_types.get("status") == "ok":
     parts.append("%d prototypes" % func_types.get("applied", 0))
+  if frames.get("status") == "ok":
+    parts.append(
+      "%d frame members in %d functions"
+      % (frames.get("names_applied", 0), frames.get("functions_touched", 0))
+    )
   if lvars.get("status") == "ok":
     parts.append(
       "%d lvars in %d functions"
@@ -445,6 +478,7 @@ def main():
   folders_json = args.get("folders")
   lvars_json = args.get("lvars")
   types_json = args.get("types")
+  frames_json = args.get("frames")
   report_json = args.get("report")
   type_mode = args.get("typemode", "all")
 
@@ -484,6 +518,11 @@ def main():
     func_types = _apply_function_types(types_json, pairs)
     _count_missing_prototypes(bd, pairs, observer)
 
+    # Frames before lvars: naming a stack slot in the frame is what the
+    # disassembly shows, naming the Hex-Rays variable is what the
+    # pseudo-code shows, and where the two disagree the lvar setting is the
+    # one the decompiler honours. So apply the weaker one first.
+    frames = _apply_frames(frames_json, pairs)
     lvars = _apply_lvars(lvars_json, pairs)
     folders = _apply_folders(folders_json)
     refreshed = _refresh_exported_rows(bd, pairs)
@@ -494,6 +533,7 @@ def main():
       "prototype_failures": observer.prototype_failures,
       "local_types": local_types,
       "function_types": func_types,
+      "frames": frames,
       "lvars": lvars,
       "folders": folders,
       "exported_rows_refreshed": refreshed,
@@ -501,6 +541,7 @@ def main():
 
     print("[port] " + json.dumps(report["functions"]))
     print(f"[port] function types: {json.dumps(func_types)}")
+    print(f"[port] frames: {json.dumps(frames)}")
     print(f"[port] lvars: {json.dumps(lvars)}")
     print(f"[port] folders: {json.dumps(folders)}")
 

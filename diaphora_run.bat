@@ -24,6 +24,9 @@ rem      --ai           write the AI export only
 rem      --outdir DIR   where the AI export goes. Defaults to
 rem                     <new>_vs_<old>.aidiff next to the new database.
 rem      --no-folders   do not port the function folder layout
+rem      --no-frames    do not port the stack frame member names/types
+rem      --baseline     diff with plain Diaphora and port nothing, to get
+rem                     a reference set of numbers
 rem      --force        export again even when a previous export is there
 rem      -h, --help     this text
 rem
@@ -65,6 +68,7 @@ if not defined DIAPHORA_DIR set "DIAPHORA_DIR=%SELF_DIR%"
 if not defined PYTHON_EXE set "PYTHON_EXE=python"
 if not defined PORT_FOLDERS set "PORT_FOLDERS=1"
 if not defined PORT_LVARS set "PORT_LVARS=1"
+if not defined PORT_FRAMES set "PORT_FRAMES=1"
 if not defined PORT_TYPES set "PORT_TYPES=all"
 if not defined PROTECT_OLD set "PROTECT_OLD=1"
 if not defined USE_DECOMPILER set "USE_DECOMPILER=1"
@@ -108,6 +112,10 @@ if defined WANT_OUTDIR (
   set "PORT_FOLDERS=0"
 ) else if /I "%~1"=="--no-lvars" (
   set "PORT_LVARS=0"
+) else if /I "%~1"=="--no-frames" (
+  set "PORT_FRAMES=0"
+) else if /I "%~1"=="--baseline" (
+  set "DO_BASELINE=1"
 ) else if /I "%~1"=="--no-types" (
   set "PORT_TYPES=0"
 ) else if /I "%~1"=="--no-protect-old" (
@@ -139,6 +147,17 @@ if /I not "%PORT_TYPES%"=="all" if /I not "%PORT_TYPES%"=="missing" if not "%POR
   exit /b 1
 )
 if not defined NEW_IDB goto :usage
+
+rem --baseline answers "is the diff itself right": export, diff and write
+rem the AI export, but port nothing at all, so the numbers come from plain
+rem Diaphora and nothing has been written into the new database.
+if defined DO_BASELINE (
+  if defined DO_PORT (
+    echo [ERROR] --baseline ports nothing, so it cannot be combined with --port.
+    exit /b 1
+  )
+  set "DO_AI=1"
+)
 
 rem No feature selected means both of them, which is the reason this script
 rem exists in the first place.
@@ -269,6 +288,7 @@ rem live in the space free scratch directory. The report is copied out at the en
 set "FOLDERS_JSON=%TMPDIR%\folders.json"
 set "LVARS_JSON=%TMPDIR%\lvars.json"
 set "TYPES_JSON=%TMPDIR%\types.json"
+set "FRAMES_JSON=%TMPDIR%\frames.json"
 set "PORT_REPORT=%TMPDIR%\port_report.json"
 set "LOG_DUMP=%LOGDIR%\dump_old.log"
 set "LOG_EXPORT_OLD=%LOGDIR%\export_old.log"
@@ -290,8 +310,9 @@ set "ABORT="
 
 echo [INFO] Old database: %OLD_ORIG%
 echo [INFO] New database: %NEW_IDB%
-if defined DO_PORT echo [INFO] Porting:      names / prototypes / comments / types ^(%PORT_TYPES%^) / globals / lvars / folders
+if defined DO_PORT echo [INFO] Porting:      names / prototypes / comments / types ^(%PORT_TYPES%^) / globals / frames / lvars / folders
 if defined DO_AI echo [INFO] AI export:    %OUTDIR%
+if defined DO_BASELINE echo [INFO] Baseline:     plain Diaphora, nothing is ported
 echo [INFO] Scratch:      %TMPDIR%
 
 rem ---- backup of the new IDB (kept on purpose, not cleaned up) ---------------
@@ -321,6 +342,9 @@ rem not.) A failure here is not fatal, we simply port everything else.
 set "FOLDERS_ARG="
 set "LVARS_ARG="
 set "TYPES_ARG="
+set "FRAMES_ARG="
+set "BASELINE_ARG="
+if defined DO_BASELINE set "BASELINE_ARG=--baseline"
 if defined DO_PORT call :dump_old
 if defined ABORT goto :abort
 
@@ -401,7 +425,7 @@ if defined DO_AI (
     --results "%RESULTS_SQLITE%" --new "%NEW_SQLITE%" --old "%OLD_SQLITE%" ^
     --outdir "%OUTDIR%" --max-diffs %AI_DIFF_MAX_DIFFS% ^
     --context %AI_DIFF_CONTEXT% --min-ratio %AI_DIFF_MIN_RATIO% ^
-    --new-label "%NEW_LABEL%" --old-label "%OLD_LABEL%"
+    --new-label "%NEW_LABEL%" --old-label "%OLD_LABEL%" %BASELINE_ARG%
   if errorlevel 1 (
     echo [ERROR] Could not write the AI export.
     set "FAIL_AI=1"
@@ -449,7 +473,7 @@ exit /b 1
 rem =============================================================================
 :dump_old
 call :step "Dumping folders, local variables and types from OLD database..."
-"%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_analysis.py folders=%FOLDERS_JSON% lvars=%LVARS_JSON% types=%TYPES_JSON%" -L"%LOG_DUMP%" "%OLD_IDB%"
+"%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_analysis.py folders=%FOLDERS_JSON% lvars=%LVARS_JSON% types=%TYPES_JSON% frames=%FRAMES_JSON%" -L"%LOG_DUMP%" "%OLD_IDB%"
 rem The dump script swallows its own errors and still exits 0, so a non-zero
 rem code here means IDA itself could not open the database. Stop now instead of
 rem carrying on to the export: opening a database that just failed to open is
@@ -484,6 +508,18 @@ if "%PORT_LVARS%"=="1" (
   )
 ) else (
   echo        lvars:   skipped ^(PORT_LVARS=%PORT_LVARS%^)
+)
+
+if "%PORT_FRAMES%"=="1" (
+  if exist "%FRAMES_JSON%.ok" (
+    set "FRAMES_ARG= frames=%FRAMES_JSON%"
+    for /f "usebackq delims=" %%L in ("%FRAMES_JSON%.ok") do echo        frames:  %%L
+  ) else (
+    echo        frames:  NOT dumped, the stack frame members will not be ported
+    if exist "%FRAMES_JSON%.fail" type "%FRAMES_JSON%.fail"
+  )
+) else (
+  echo        frames:  skipped ^(PORT_FRAMES=%PORT_FRAMES%^)
 )
 
 if not "%PORT_TYPES%"=="0" (
@@ -524,8 +560,8 @@ if not "!_PATHS!"=="!_PATHS: =!" (
 )
 set "_PATHS="
 
-call :step "Importing names / prototypes / comments / types / globals / lvars / folders into NEW database..."
-"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py results=!S_RESULTS! main=!S_NEW! diff=!S_OLD! report=%PORT_REPORT%%FOLDERS_ARG%%LVARS_ARG%%TYPES_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
+call :step "Importing names / prototypes / comments / types / globals / frames / lvars / folders into NEW database..."
+"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py results=!S_RESULTS! main=!S_NEW! diff=!S_OLD! report=%PORT_REPORT%%FOLDERS_ARG%%LVARS_ARG%%TYPES_ARG%%FRAMES_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
 
 rem The marker files land next to the path the script was given, which is the
 rem 8.3 one -- and "results.sqlite" does not survive 8.3 unchanged, so looking
@@ -639,6 +675,7 @@ echo   --outdir DIR   where the AI export goes
 echo                  ^(default: ^<new^>_vs_^<old^>.aidiff next to the new database^)
 echo   --no-folders   do not port the function folder layout
 echo   --no-lvars     do not port the Hex-Rays local variables
+echo   --no-frames    do not port the stack frame member names and types
 echo   --types MODE   "all" to replace a type the new database already has,
 echo                  "missing" to only fill in what is absent ^(default: all^)
 echo   --no-types     leave the types to Diaphora's own C text path

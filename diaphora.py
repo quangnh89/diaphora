@@ -1054,8 +1054,19 @@ class CBinDiff:
       tmp = self.re_sub(rep + "[a-f0-9A-F]+", "XXXX", tmp)
 
     # Remove dword ptr, byte ptr, etc...
+    #
+    # NOTE: this used to be `rep + "[a-f0-9A-F]+"`, which had 2 bugs: the size
+    # prefix was only ever removed when followed by hexadecimal digits, so the
+    # very common `dword ptr [rsp+30h+var_38]` kept its prefix, and on something
+    # like `byte ptr cs:g_Whatever` the `[a-f0-9A-F]+` part happily matched the
+    # `c` of `cs:`, turning the operand into `s:g_Whatever`. Just drop the
+    # prefix, which is what the comment above always said it did.
+    #
+    # The leading \b matters: CLEANING_CMP_REMS holds "word ptr " as well, and
+    # without a boundary that one matches inside "qword ptr " and
+    # "xmmword ptr " too, leaving "q[rsp+8]" and "xmm[rsp+8]" behind.
     for rep in config.CLEANING_CMP_REMS:
-      tmp = self.re_sub(rep + "[a-f0-9A-F]+", "", tmp)
+      tmp = self.re_sub(r"\b" + rep.rstrip() + r"\s+", "", tmp)
 
     reps = [r"\+[a-f0-9A-F]+h\+"]
     for rep in reps:

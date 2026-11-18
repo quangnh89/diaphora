@@ -8,22 +8,24 @@ into another database:
     the Functions window folder layout   -> diaphora_func_folders.py
     Hex-Rays local variables and args    -> diaphora_lvars.py
     local types and function prototypes  -> diaphora_types.py
+    stack frame member names and types   -> diaphora_frames.py
 
 Usage (run with idat/idat64 in batch/autonomous mode):
 
-    idat64 -A -S"diaphora_dump_analysis.py folders=<p> lvars=<p> types=<p>" \\
+    idat64 -A -S"diaphora_dump_analysis.py folders=<p> lvars=<p> types=<p> \\
+                                           frames=<p>" \\
            -L<logfile> <source.i64>
 
 Arguments are name=value tokens, in any order, and each one is optional --
 IDA splits the -S string on whitespace, so none of these paths may contain a
-space. Each half is independent: one failing does not stop the others, and
+space. Each dump is independent: one failing does not stop the others, and
 none of them failing stops the port that follows. A ".ok" / ".fail" marker
 file is left next to each output so a calling shell script can check the
 outcome without scraping IDA's log.
 
-All three dumps are cheap. The folder layout is a tree walk, the local
-variables are a netnode read, and the types come straight out of the type
-library: none of them decompiles anything.
+Every dump is cheap. The folder layout is a tree walk, the local variables
+are a netnode read, and both the types and the stack frames come straight
+out of the type library: none of them decompiles anything.
 
 Nothing is written into the database: like Diaphora's own exporting step,
 this ends through idaapi.qexit(), which does not save. IDA still rewrites
@@ -76,10 +78,19 @@ def _dump_types(out_file):
   return f"{local_types} local types, {functions} function types"
 
 
+def _dump_frames(out_file):
+  from diaphora_frames import dump_frames
+
+  functions, members = dump_frames(out_file)
+  print(f"[frames] Dumped {members} frame member(s) in {functions} function(s)")
+  return f"{members} members, {functions} functions"
+
+
 DUMPERS = (
   ("folders", _dump_folders),
   ("lvars", _dump_lvars),
   ("types", _dump_types),
+  ("frames", _dump_frames),
 )
 
 
@@ -110,7 +121,7 @@ def main():
   try:
     args = _parse_args()
     if not args:
-      print("[dump] Nothing to do: pass folders=, lvars= and/or types=")
+      print("[dump] Nothing to do: pass folders=, lvars=, types= and/or frames=")
       return
 
     idc.auto_wait()

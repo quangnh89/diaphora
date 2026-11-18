@@ -149,9 +149,11 @@ databases for SQL queries.
 | `--outdir DIR` | Where the AI export goes. Default: `<new>_vs_<old>.aidiff` next to the new database |
 | `--no-folders` | Do not port the function folder layout |
 | `--no-lvars` | Do not port the Hex-Rays local variables |
+| `--no-frames` | Do not port the stack frame member names and types |
 | `--types all` \| `missing` | Replace a type the new database already has, or only fill in what is absent. Default `all` |
 | `--no-types` | Leave the types to Diaphora's own C text path |
 | `--no-protect-old` | Read the old database directly instead of a scratch copy |
+| `--baseline` | Export, diff and write the AI export, but port nothing. Plain Diaphora's own numbers, for use as a reference. Cannot be combined with `--port` |
 | `--force` | Export again even when a previous export is there |
 | `-h`, `--help` | Usage |
 
@@ -186,25 +188,50 @@ Every match carries `code_changed` and the `code` verdict behind it:
 | `code` | Means |
 |---|---|
 | `same-bytes` | Identical instruction bytes. Proof. |
-| `same-asm` | Identical normalised disassembly: symbol names and addresses become placeholders, registers and immediate values are kept. |
-| `same-asm-renamed-stack` | Identical once the stack frame member names are masked too. Weaker — see below. |
+| `same-asm` | Identical disassembly once both sides are canonicalised: comments, symbol names, addresses, size prefixes, stack frame member names and struct-field operands removed; registers and immediate values kept. |
+| `same-asm-annotated` | Identical except where one database names something the other left auto-generated. See below. |
 | `changed` | The instructions differ. |
 
-The per-function diffs are split on it:
+Each match also carries `asm_similarity`, how alike the two canonical forms
+are, and `suspect`.
+
+The per-function diffs are split on the verdict:
 
 - `changed/` — the instructions differ. Each diff has an `.asm.diff` beside it
   showing the machine level change, down to a single `add rdi, 8` becoming
-  `add rdi, 9`.
+  `add rdi, 9`. **Start here.**
 - `cosmetic/` — same instructions, different rendering: a name, a type, a local
   variable or a struct field that exists on one side only.
+- `suspect/` — the instructions differ, but the two sides also have a different
+  number of basic blocks *and* an `asm_similarity` below `0.50`. Far more
+  likely a pair Diaphora matched wrongly than a function that was rewritten.
+  These are still imported by the porting step, so if a name or type in the
+  new database looks wrong, check this list first.
 
-`same-asm-renamed-stack` exists because stack frame member names are not
-ported: a slot the old database calls `gpaOut` is still `arg_18` in the new
-one, and that alone made 274 unchanged functions out of 4611 read as changed
-on a real pair of builds. Masking those names is weaker than `same-asm`,
-since it cannot tell two different stack slots apart — though Diaphora's own
-normaliser has already replaced the numeric part of the operand (`+48h+` ->
-`+XXXX+`), so the name was the only thing distinguishing them to begin with.
+### Why the comparison is not just a text diff
+
+Diaphora's `clean_assembly` replaces IDA's *auto-generated* names (`sub_`,
+`dword_`, `loc_`, …) with a placeholder and leaves names a human gave alone.
+That is fine when both databases are annotated to the same degree, and this is
+the one case where they never are: the old database has names, types and struct
+fields everywhere, the new one has whatever the port reached. Compared as plain
+text, every annotated operand reads as a change.
+
+Measured on hvax64 `9711` → `9836`, of the 1157 matches whose bytes differ:
+
+| Cause | Matches |
+|---|---|
+| Stack frame member names and size prefixes | 692 |
+| Named global vs placeholder | 121 |
+| Same family one level deeper (struct-field operands) | 239 |
+| Genuinely different code | 103 |
+
+So 91% of the differences were annotation, not code. The verdict therefore
+canonicalises both sides first, then aligns the two line lists and only calls a
+difference cosmetic when it really is one-sided annotation — a rename from one
+*named* symbol to another stays `changed`. On that pair this took `changed`
+from 881 down to the ~350 that are real, and of the 1253 matches it reclassified
+as unchanged, zero had a differing mnemonic sequence or instruction count.
 
 Deliberately not based on the `mnemonics` column: that one drops the operands,
 so it cannot tell `mov eax` from `mov ecx` and would hide a real change.
@@ -244,6 +271,28 @@ step that writes the ported state back into `db/new.sqlite` decompiles the
 matched functions once more, so a big database spends real time there.
 `--no-lvars` skips it.
 
+### Stack frame members
+
+A separate thing from the local variables above, and easy to confuse with
+them. Hex-Rays local variables live in a netnode and show in the pseudo-code;
+stack frame members live in the function's frame type and show in the
+*disassembly*, as `[rsp+58h+flag]` rather than `[rsp+58h+var_40]`. Nothing in
+Diaphora carries them over and neither did anything here until
+`diaphora_frames.py`. On hvax64 they were the single largest difference between
+the two databases, 692 of the 1157 functions whose disassembly did not match.
+
+Members are matched on their offset in the frame, which the emitted code fixes
+and which is therefore the same in both builds as long as the body is. The
+whole function is skipped when its frame size differs, since a frame that grew
+or shrank means every offset in it would be a guess
+(`frames.skipped_layout`). Auto-generated names (`var_38`, `arg_8`, the
+saved-register and return-address slots) are not dumped at all.
+
+Reading and writing a frame is a type library operation, so this decompiles
+nothing and costs very little. `--no-frames` skips it. Note that it does not
+make the diff smaller — the AI export masks frame member names on both sides
+before comparing — it makes the new database readable.
+
 The old database is copied into the scratch directory and the original is
 never opened, so it comes out of a run byte for byte identical. That is not
 paranoia: IDA rewrites the `.i64` container whenever it closes one, and the
@@ -274,6 +323,7 @@ key; this is the full list:
 | `USE_DECOMPILER` | both halves | `1` | `0` exports without Hex-Rays: much faster, but the diffs then show assembly instead of pseudo-code |
 | `PORT_FOLDERS` | `--port` | `1` | `0` skips porting the function folder layout, same as `--no-folders` |
 | `PORT_LVARS` | `--port` | `1` | `0` skips porting the Hex-Rays local variables, same as `--no-lvars` |
+| `PORT_FRAMES` | `--port` | `1` | `0` skips porting the stack frame member names and types, same as `--no-frames` |
 | `PORT_TYPES` | `--port` | `all` | `missing` only fills in absent types, `0` leaves them to Diaphora's C text path |
 | `PROTECT_OLD` | both halves | `1` | `0` reads the old database directly instead of a scratch copy |
 | `DIAPHORA_MINIMUM_IMPORT_RATIO` | `--port` | `0.5` | Similarity a match needs before it is imported |

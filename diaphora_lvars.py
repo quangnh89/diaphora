@@ -55,7 +55,7 @@ import ida_hexrays
 import ida_name
 import ida_typeinf
 
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 
 def _log(message):
@@ -84,6 +84,28 @@ def _type_string(tinfo):
   except Exception: # noqa: BLE001
     pass
   return ""
+
+
+def _type_decl(tinfo):
+  """
+  The type as a declaration of a variable called `x`, which is what IDA's
+  parser takes back.
+
+  dstr() prints an abstract declarator, and that only round-trips when the
+  declarator is a plain prefix. An array variable comes out as
+  "unsigned __int16[4]", and "unsigned __int16[4] x;" is not C: the brackets
+  belong after the name, so every array and function-pointer local used to
+  land in `types_unparsed`. print_tinfo puts the name in the right place.
+  """
+  try:
+    if tinfo is None or tinfo.empty():
+      return ""
+    return ida_typeinf.print_tinfo(
+      None, 0, 0, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_SEMI,
+      tinfo, "x", None,
+    ) or ""
+  except Exception: # noqa: BLE001
+    return ""
 
 
 def _locator_of(lvar):
@@ -124,6 +146,7 @@ def dump_lvars(out_path):
         "loc": key,
         "defea_off": info.ll.defea - ea,
         "name": info.name or "",
+        "decl": _type_decl(info.type),
         "type_name": _type_string(info.type),
         "cmt": info.cmt or "",
       }
@@ -243,14 +266,16 @@ def _apply_type(ea_new, locator, entry, counts):
   correctly because diaphora_types.py has already brought the whole type
   library across.
   """
-  decl = entry.get("type_name")
+  decl = entry.get("decl")
+  if not decl:
+    # Dumps written before `decl` existed only carry the displayed form.
+    text = entry.get("type_name")
+    decl = f"{text} x;" if text else ""
   if not decl:
     return
 
   tinfo = ida_typeinf.tinfo_t()
-  # dstr() prints an abstract declarator and IDA's parser wants a name,
-  # hence the dummy one.
-  if ida_typeinf.parse_decl(tinfo, None, f"{decl} x;", ida_typeinf.PT_SIL) is None:
+  if ida_typeinf.parse_decl(tinfo, None, decl, ida_typeinf.PT_SIL) is None:
     counts["types_unparsed"] += 1
     if len(counts["unparsed_examples"]) < 20:
       counts["unparsed_examples"].append({"ea": "0x%x" % ea_new, "type": decl[:120]})
