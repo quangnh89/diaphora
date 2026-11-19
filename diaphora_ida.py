@@ -1844,10 +1844,12 @@ class CIDABinDiff(diaphora.CBinDiff):
     if cmt2 is not None and get_cmt(ea1, 1) is None:
       set_cmt(ea1, cmt2, 1)
 
-    for operand_name in operand_names:
-      index, name = operand_name
-      if name:
-        ida_bytes.set_forced_operand(ea1, index, name)
+    # `forced`, not `name`: this used to reuse the very variable holding the
+    # name of the referenced item, so an instruction with a forced operand
+    # handed the renaming below the forced operand text instead of that name.
+    for index, forced in operand_names:
+      if forced:
+        ida_bytes.set_forced_operand(ea1, index, forced)
 
     if mcmt is not None:
       cfunc = decompile(ea1)
@@ -1879,21 +1881,22 @@ class CIDABinDiff(diaphora.CBinDiff):
     the_type = False
     data_refs = list(DataRefsFrom(ea1))
     if len(data_refs) > 0:
-      # Global variables
+      # Global variables.
+      #
+      # The name goes on the item this instruction references, and nowhere
+      # else. This used to follow the reference one step further when that item
+      # was an offset -- "we don't want to rename the offset, we want to rename
+      # the true global variable" -- which is wrong, because the exporting side
+      # records the name of the *direct* reference and never follows anything
+      # (see process_instruction below). So following here could only ever put
+      # the name somewhere the source database did not have it.
+      #
+      # Measured on two builds of one hvax64.exe: the fourteen function
+      # pointers of .data:23200 (g_HvSerialRegIoRead8 and its siblings) are
+      # offsets into the crypto PAL, so instead of naming the pointers, the
+      # import renamed the functions they point at -- and applied the type of a
+      # function pointer to a function.
       tmp_ea = data_refs[0]
-      if tmp_ea in self.names:
-        curr_name = get_ea_name(tmp_ea)
-        if curr_name != name and self.is_auto_generated(curr_name):
-          set_name(tmp_ea, name, SN_CHECK)
-          the_type = False
-      else:
-        # If it's an object, we don't want to rename the offset, we want to
-        # rename the true global variable.
-        if is_off(get_full_flags(tmp_ea), OPND_ALL):
-          tmp_ea = next(DataRefsFrom(tmp_ea), tmp_ea)
-
-        set_name(tmp_ea, name, SN_CHECK)
-        the_type = True
     else:
       # Functions
       code_refs = list(CodeRefsFrom(ea1, 0))
@@ -1901,11 +1904,33 @@ class CIDABinDiff(diaphora.CBinDiff):
         code_refs = list(CodeRefsFrom(ea1, 1))
 
       if len(code_refs) > 0:
-        curr_name = get_ea_name(code_refs[0])
-        if curr_name != name and self.is_auto_generated(curr_name):
-          set_name(code_refs[0], name, SN_CHECK)
-          tmp_ea = code_refs[0]
-          the_type = True
+        tmp_ea = code_refs[0]
+
+    # A row can carry a comment and no name at all, and set_name(ea, None) is
+    # not a no-op that IDA ignores: it was being called 2887 times in one
+    # import, failing every time.
+    if tmp_ea is not None and name:
+      curr_name = get_ea_name(tmp_ea)
+      if curr_name == name:
+        # Already named, by an earlier run or by the function import. Let the
+        # type below still run, so that porting twice changes nothing.
+        the_type = True
+      elif not ida_bytes.has_user_name(get_full_flags(tmp_ea)):
+        # Only ever replace a name IDA made up itself.
+        #
+        # There was a guard to this effect before, but it asked
+        # `tmp_ea in self.names`, and self.names is a snapshot taken when this
+        # object was built -- so every function the running import had just
+        # named was missing from it, the guard never fired for them, and their
+        # names were overwritten. 31 names went that way in one import, among
+        # them hv_uart16550_bind_legacy_com_port, replaced by the name of the
+        # struct of pointers that points at it.
+        #
+        # has_user_name() asks IDA instead of guessing from a prefix, so
+        # `xmmword_`, `algn_` and everything else missing from
+        # CLEANING_CMP_REPS no longer counts as a name worth keeping, while a
+        # name that came from a symbol file does.
+        the_type = bool(set_name(tmp_ea, name, SN_CHECK))
 
     if tmp_ea is not None and the_type:
       if mtype is not None and idc.get_type(tmp_ea) != mtype:

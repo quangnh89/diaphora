@@ -31,6 +31,9 @@ rem                     old database
 rem      --baseline     diff with plain Diaphora and port nothing, to get
 rem                     a reference set of numbers
 rem      --force        export again even when a previous export is there
+rem      --name-trace   write name_trace.jsonl: one line per rename the port
+rem                     makes, saying what name was there before and whether
+rem                     the address is a function, a label or data
 rem      -h, --help     this text
 rem
 rem  Exporting both databases and diffing them is by far the most expensive
@@ -38,12 +41,13 @@ rem  part, and both deliverables need exactly that. Doing it once is the whole
 rem  point of this script: running the two halves separately would export
 rem  twice and diff twice.
 rem
-rem  The AI export is written BEFORE the porting step, so that it describes the
-rem  databases exactly as they were diffed -- honest similarity ratios, and the
-rem  names both sides had at diff time. As a welcome side effect it survives a
-rem  failing import. Diaphora's import rewrites the rows of every function it
-rem  touches in the primary database, so the import runs against copies in the
-rem  scratch directory and db\new.sqlite is left as it was diffed.
+rem  The AI export is written AFTER the porting step, and reads the rows the
+rem  import refreshed for every function it touched -- so it compares
+rem  pseudo-code whose names and types already match the old database, instead
+rem  of reporting "status" versus "v4" on a function nothing happened to. It
+rem  runs even when the import failed, in which case it describes the database
+rem  un-ported and says so. (This paragraph used to claim the opposite order;
+rem  the code has said :do_import first for a while.)
 rem
 rem  Nothing is written into the OLD database. The NEW one is modified in place
 rem  by the porting step, which first makes a backup copy next to it and keeps
@@ -75,6 +79,7 @@ if not defined PORT_FRAMES set "PORT_FRAMES=1"
 if not defined CREATE_FUNCS set "CREATE_FUNCS=1"
 if not defined PORT_TYPES set "PORT_TYPES=all"
 if not defined PROTECT_OLD set "PROTECT_OLD=1"
+if not defined NAME_TRACE set "NAME_TRACE=0"
 if not defined USE_DECOMPILER set "USE_DECOMPILER=1"
 if not defined AI_DIFF_MAX_DIFFS set "AI_DIFF_MAX_DIFFS=2000"
 if not defined AI_DIFF_CONTEXT set "AI_DIFF_CONTEXT=3"
@@ -126,6 +131,8 @@ if defined WANT_OUTDIR (
   set "PORT_TYPES=0"
 ) else if /I "%~1"=="--no-protect-old" (
   set "PROTECT_OLD=0"
+) else if /I "%~1"=="--name-trace" (
+  set "NAME_TRACE=1"
 ) else if /I "%~1"=="--types" (
   set "WANT_TYPEMODE=1"
 ) else if /I "%~1"=="--force" (
@@ -298,6 +305,7 @@ set "FRAMES_JSON=%TMPDIR%\frames.json"
 set "FUNCS_JSON=%TMPDIR%\funcs.json"
 set "FUNCS_REPORT=%TMPDIR%\funcs_report.json"
 set "PORT_REPORT=%TMPDIR%\port_report.json"
+set "NAME_TRACE_JSON=%TMPDIR%\name_trace.jsonl"
 set "LOG_DUMP=%LOGDIR%\dump_old.log"
 set "LOG_FUNCS=%LOGDIR%\create_funcs.log"
 set "LOG_EXPORT_OLD=%LOGDIR%\export_old.log"
@@ -480,6 +488,15 @@ if defined DO_PORT if exist "%PORT_REPORT%" (
   )
   copy /y "%PORT_REPORT%" "!REPORT_KEPT!" >nul 2>&1
 )
+set "TRACE_KEPT="
+if defined DO_PORT if exist "%NAME_TRACE_JSON%" (
+  if defined DO_AI (
+    set "TRACE_KEPT=!OUTDIR!\name_trace.jsonl"
+  ) else (
+    set "TRACE_KEPT=!NEW_IDB!.name_trace.jsonl"
+  )
+  copy /y "%NAME_TRACE_JSON%" "!TRACE_KEPT!" >nul 2>&1
+)
 
 rem ---- report ----------------------------------------------------------------
 echo.
@@ -489,6 +506,7 @@ if defined DO_AI if defined FAIL_AI echo [FAIL] The AI export could not be writt
 if defined DO_PORT if not defined FAIL_PORT echo [OK] %NEW_IDB% has been updated in place.
 if defined DO_PORT if not defined FAIL_PORT echo [OK] Backup of the pre-import state kept at %BACKUP%
 if defined REPORT_KEPT echo [OK] What the port carried over: %REPORT_KEPT%
+if defined TRACE_KEPT echo [OK] Every rename the port made: %TRACE_KEPT%
 if defined DO_PORT if defined FAIL_PORT echo [FAIL] Porting failed, %NEW_IDB% is unchanged beyond its backup at %BACKUP%
 
 call :cleanup
@@ -618,8 +636,14 @@ if not "!_PATHS!"=="!_PATHS: =!" (
 )
 set "_PATHS="
 
+rem A record of every rename, for when the question is not "how much was
+rem ported" but "why did THAT name end up THERE". Off by default: it is one
+rem line per set_name() call, tens of thousands of them on a real database.
+set "TRACE_ARG="
+if "%NAME_TRACE%"=="1" set "TRACE_ARG= trace=%NAME_TRACE_JSON%"
+
 call :step "Importing names / prototypes / comments / types / globals / frames / lvars / folders into NEW database..."
-"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py results=!S_RESULTS! main=!S_NEW! diff=!S_OLD! report=%PORT_REPORT%%FOLDERS_ARG%%LVARS_ARG%%TYPES_ARG%%FRAMES_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
+"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_auto_import.py results=!S_RESULTS! main=!S_NEW! diff=!S_OLD! report=%PORT_REPORT%%FOLDERS_ARG%%LVARS_ARG%%TYPES_ARG%%FRAMES_ARG%%TRACE_ARG%" -L"%LOG_IMPORT%" "%NEW_IDB%"
 
 rem The marker files land next to the path the script was given, which is the
 rem 8.3 one -- and "results.sqlite" does not survive 8.3 unchanged, so looking
@@ -743,6 +767,9 @@ echo                  ^(the copy exists because opening a database rewrites it^)
 echo   --baseline     export, diff and write the AI export, but port nothing,
 echo                  for plain Diaphora's own numbers as a reference
 echo   --force        export again even when a previous export is there
+echo   --name-trace   write name_trace.jsonl: one line per rename the port makes,
+echo                  with the name that was there before and whether the address
+echo                  is a function, a label or data
 echo   -h, --help     this text
 echo.
 echo Settings live in .env next to this script, see .env.example.

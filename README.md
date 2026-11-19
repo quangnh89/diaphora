@@ -126,7 +126,16 @@ comments, pseudo-code comments, struct/enum/union/typedef definitions, global
 variable names and types, the Hex-Rays local variables (function arguments
 included) and the Functions window folder layout from the old database into
 the new one. The new database is modified in place, after a backup of it is
-made and kept. `port_report.json` says how much of each actually went across.
+made and kept. `port_report.json` says how much of each actually went across,
+including `names_overwritten` — renames that replaced a name somebody had
+chosen, which is always worth a look. `--name-trace` records every single
+rename if you need to know why one name ended up where it did.
+
+A global variable's name goes to the address the instruction references, never
+to what that address points at. Following the pointer is what Diaphora does
+upstream, and on two builds of one hvax64.exe it took the 14 function pointers
+of `.data:23200` (`g_HvSerialRegIoRead8` and its siblings) and named the crypto
+PAL functions they point at after them, overwriting the real names.
 
 Types — the local type definitions and the function prototypes — are
 transferred in IDA's own serialized form rather than printed as C and parsed
@@ -156,6 +165,7 @@ databases for SQL queries.
 | `--no-protect-old` | Read the old database directly instead of a scratch copy |
 | `--baseline` | Export, diff and write the AI export, but port nothing. Plain Diaphora's own numbers, for use as a reference. Cannot be combined with `--port` |
 | `--force` | Export again even when a previous export is there |
+| `--name-trace` | Write `name_trace.jsonl`: one line per rename the port makes, with the name that was there before and whether the address is a function, a label or data |
 | `-h`, `--help` | Usage |
 
 ## Two builds of the same module

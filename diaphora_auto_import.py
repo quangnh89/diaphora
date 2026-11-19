@@ -58,6 +58,12 @@ whitespace, so none of these paths may contain a space.
     types     the local and function types dumped by the same script
     frames    the stack frame members dumped by the same script
     report    where to write the port report
+    trace     where to write a jsonl record of every single rename the import
+              performs, one line per set_name() call, with the name that was
+              there before and whether the address is a function, a point
+              inside one, or data. Off unless given. This is a debugging
+              instrument: it is what shows a *data* name landing on a
+              function, which no other output of the pipeline reveals.
     typemode  "all" to replace a type the target already has, "missing" to
               keep it and only fill in what is absent. Default "all".
 
@@ -73,7 +79,9 @@ import traceback
 
 import idc
 import idaapi
+import ida_bytes
 import ida_funcs
+import ida_name
 
 import diaphora
 import diaphora_ida
@@ -86,6 +94,45 @@ def _write_flag(path, text):
       fh.write(text)
   except OSError:
     pass
+
+
+def _has_user_name(ea):
+  """
+  True when the name at @ea was put there by a person (or by a symbol file),
+  as opposed to one of IDA's own `sub_`/`off_`/`unk_` placeholders.
+
+  getattr() because this is only used for diagnostics: a missing API must not
+  be able to fail the port.
+  """
+  check = getattr(ida_bytes, "has_user_name", None)
+  if check is None:
+    return False
+  try:
+    return bool(check(ida_bytes.get_full_flags(ea)))
+  except Exception:  # noqa: BLE001
+    return False
+
+
+def _target_kind(ea):
+  """
+  What kind of thing is being named: the start of a function, a point inside
+  one, bare code, or data.
+
+  Worth separating because they mean very different things. Naming the start
+  of a function is the port doing its job; naming an address inside one claims
+  a name the function itself may need next; and a name the old database uses
+  for *data* landing on any of the code kinds is the bug this tracing was
+  added to catch.
+  """
+  func = ida_funcs.get_func(ea)
+  if func is not None:
+    return "func_start" if func.start_ea == ea else "inside_func"
+  try:
+    if ida_bytes.is_code(ida_bytes.get_full_flags(ea)):
+      return "code"
+  except Exception:  # noqa: BLE001
+    pass
+  return "data"
 
 
 def _parse_args():
@@ -132,9 +179,55 @@ class CPortObserver:
       "prototypes_missing": 0,
       "globals_renamed": 0,
       "globals_retyped": 0,
+      "labels_renamed": 0,
+      "names_overwritten": 0,
     }
     self.prototype_failures = []
+    self.overwritten = []
     self._originals = {}
+    self._trace_fh = None
+
+  def open_trace(self, path):
+    """
+    Record every rename to @path as jsonl.
+
+    Off unless asked for. It is the only way to see what the instruction level
+    import does: Diaphora reports none of it, and by the time a database is
+    saved there is nothing left to say which name came from where.
+    """
+    try:
+      self._trace_fh = open(path, "w", encoding="utf8")
+    except OSError as exc:
+      print(f"[port] Could not open the name trace {path}: {exc}")
+
+  def close_trace(self):
+    if self._trace_fh is None:
+      return
+    try:
+      self._trace_fh.close()
+    except OSError:
+      pass
+    self._trace_fh = None
+
+  def _trace(self, ea, name, was, kind, ok):
+    if self._trace_fh is None:
+      return
+    try:
+      self._trace_fh.write(
+        json.dumps(
+          {
+            "ea": "0x%x" % ea,
+            "name": name,
+            "was": was,
+            "target": kind,
+            "ok": bool(ok),
+          },
+          ensure_ascii=False,
+        )
+        + "\n"
+      )
+    except (OSError, TypeError, ValueError):
+      pass
 
   def install(self):
     """
@@ -162,12 +255,30 @@ class CPortObserver:
       self.counts["names_kept"] += 1
       return True
 
+    # Both of these have to be read before the rename, not after.
+    was = ida_name.get_ea_name(ea)
+    had_user_name = _has_user_name(ea)
+
     ok = self._originals["set_name"](ea, name, flags)
+    kind = _target_kind(ea)
     if ok:
-      if ida_funcs.get_func(ea) is None:
+      if kind == "func_start":
+        self.counts["names_set"] += 1
+      elif kind == "data":
         self.counts["globals_renamed"] += 1
       else:
-        self.counts["names_set"] += 1
+        self.counts["labels_renamed"] += 1
+
+      if had_user_name and was != name:
+        # A name somebody chose has just been replaced. Always worth knowing:
+        # this is how a correct function name gets lost.
+        self.counts["names_overwritten"] += 1
+        if len(self.overwritten) < 40:
+          self.overwritten.append(
+            {"ea": "0x%x" % ea, "name": name, "was": was, "target": kind}
+          )
+
+    self._trace(ea, name, was, kind, ok)
     return ok
 
   def _set_type(self, ea, proto):
@@ -448,6 +559,8 @@ def _summary_line(report):
     "%d names set" % counts["names_set"],
     "%d globals renamed" % counts["globals_renamed"],
   ]
+  if counts.get("names_overwritten"):
+    parts.append("%d names OVERWRITTEN" % counts["names_overwritten"])
   if local_types.get("status") == "ok":
     parts.append(
       "%d/%d local types complete"
@@ -480,6 +593,7 @@ def main():
   types_json = args.get("types")
   frames_json = args.get("frames")
   report_json = args.get("report")
+  trace_json = args.get("trace")
   type_mode = args.get("typemode", "all")
 
   if not filename or not main_db or not diff_db:
@@ -508,11 +622,15 @@ def main():
     local_types = _apply_local_types(types_json, type_mode)
     print(f"[port] local types: {json.dumps(local_types)}")
 
+    if trace_json:
+      observer.open_trace(trace_json)
+
     observer.install()
     try:
       items = _import_matches(bd, filename, main_db, diff_db, observer)
     finally:
       observer.remove()
+      observer.close_trace()
 
     pairs = _pairs_of(items)
     func_types = _apply_function_types(types_json, pairs)
@@ -531,6 +649,8 @@ def main():
     report = {
       "functions": observer.counts,
       "prototype_failures": observer.prototype_failures,
+      "names_overwritten": observer.overwritten,
+      "name_trace": trace_json,
       "local_types": local_types,
       "function_types": func_types,
       "frames": frames,
