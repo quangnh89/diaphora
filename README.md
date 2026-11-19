@@ -150,6 +150,7 @@ databases for SQL queries.
 | `--no-folders` | Do not port the function folder layout |
 | `--no-lvars` | Do not port the Hex-Rays local variables |
 | `--no-frames` | Do not port the stack frame member names and types |
+| `--no-create-funcs` | Do not create the functions that exist only in the old database |
 | `--types all` \| `missing` | Replace a type the new database already has, or only fill in what is absent. Default `all` |
 | `--no-types` | Leave the types to Diaphora's own C text path |
 | `--no-protect-old` | Read the old database directly instead of a scratch copy |
@@ -190,7 +191,15 @@ Every match carries `code_changed` and the `code` verdict behind it:
 | `same-bytes` | Identical instruction bytes. Proof. |
 | `same-asm` | Identical disassembly once both sides are canonicalised: comments, symbol names, addresses, size prefixes, stack frame member names and struct-field operands removed; registers and immediate values kept. |
 | `same-asm-annotated` | Identical except where one database names something the other left auto-generated. See below. |
+| `same-asm-boundary` | One side's instruction list is a strict prefix of the other's: the same code, with the two databases disagreeing about where the function ends. Only possible when both describe the same binary. |
 | `changed` | The instructions differ. |
+
+`same-bytes` means Diaphora's `bytes_hash` matched. The name oversells it:
+`get_decoded_instruction()` subtracts `ins.ops[n].offb` from each instruction's
+length before reading its bytes, so part of every operand is left out of the
+hash. It is a strong signal, not proof of byte equality, and it is not
+invariant to annotation either — two databases holding identical bytes can
+hash differently when an operand is typed in one of them.
 
 Each match also carries `asm_similarity`, how alike the two canonical forms
 are, and `suspect`.
@@ -207,6 +216,34 @@ The per-function diffs are split on the verdict:
   likely a pair Diaphora matched wrongly than a function that was rewritten.
   These are still imported by the porting step, so if a name or type in the
   new database looks wrong, check this list first.
+- `boundary/` — same code, the two databases disagree about where the function
+  ends.
+
+### Two databases of the same binary
+
+When both databases record the same input md5 they are two analyses of one
+file, so **no match can be a code change** and every difference is a database
+artefact. The comparison detects this and relaxes accordingly: it forgives
+operand rendering it would otherwise have to treat as real (an applied offset
+base turns `[rdi+rdx*8+0]` into `ds:rva dword_FFFFF8000000EC60[rdi+rdx*8]`),
+and it reports a differing function extent as `same-asm-boundary`.
+
+If a function's bytes *still* differ after that, one of the two databases has a
+byte image that no longer matches the binary — bytes were patched in it. That
+is reported in a `## Database integrity` section of `summary.md` and in
+`byte_divergence` in `manifest.json`, with the exact address and the
+instruction each side reports. On a real pair of databases of one hvax64.exe
+this found seven such functions, for example:
+
+| At | Database A | Database B |
+|---|---|---|
+| `0x321f2c` | `mov r8, r9` | `and r8, r9` |
+| `0x351fc2` | `mov edi, 10000h` | `mov r11d, 10000h` |
+
+Pass `--old-binary` / `--new-binary` (`diaphora_run.bat` fills these in when
+the binary sits next to the database) and it will also say *which* side
+diverges, by decoding the file's own bytes at that address. That needs
+`capstone`; without it the divergence is still reported, just unattributed.
 
 ### Why the comparison is not just a text diff
 
@@ -293,6 +330,34 @@ nothing and costs very little. `--no-frames` skips it. Note that it does not
 make the diff smaller — the AI export masks frame member names on both sides
 before comparing — it makes the new database readable.
 
+### Functions that exist only in the old database
+
+Diaphora can only port what it matched, and it can only match a function that
+exists on both sides. A function auto-analysis never found in the new database
+is therefore invisible to the entire pipeline: not matched, so its name,
+prototype, types, local variables, stack frame and folder never move across.
+
+This is not a corner case. Diffing two databases of *one* hvax64.exe, 227 of
+the old side's 4665 functions had no counterpart — every one of them named —
+and 218 of those had no function in the new database at all. They are the
+hypercall handlers, reached only through a dispatch table, so auto-analysis has
+nothing to follow. It is also why a ported database ends up with fewer
+functions than the one it was ported from.
+
+So the functions are created first, before the new database is exported, and
+everything downstream treats them like any other. Two cases are reported
+rather than forced, because both are a judgement call rather than an omission:
+
+- `inside_other` — the address falls inside a function the new database already
+  has, so creating it would mean splitting that one.
+- `overlaps_other` — the two databases disagree about where the function
+  *starts*; the old one has it at `…cf30` and the new one has its own function
+  at `…cf39`.
+
+This is the one porting step that writes to the new database before exporting
+it, which is why it is its own step and why the backup is taken before it.
+`--no-create-funcs` skips it.
+
 The old database is copied into the scratch directory and the original is
 never opened, so it comes out of a run byte for byte identical. That is not
 paranoia: IDA rewrites the `.i64` container whenever it closes one, and the
@@ -324,6 +389,7 @@ key; this is the full list:
 | `PORT_FOLDERS` | `--port` | `1` | `0` skips porting the function folder layout, same as `--no-folders` |
 | `PORT_LVARS` | `--port` | `1` | `0` skips porting the Hex-Rays local variables, same as `--no-lvars` |
 | `PORT_FRAMES` | `--port` | `1` | `0` skips porting the stack frame member names and types, same as `--no-frames` |
+| `CREATE_FUNCS` | `--port` | `1` | `0` skips creating the functions that exist only in the old database, same as `--no-create-funcs` |
 | `PORT_TYPES` | `--port` | `all` | `missing` only fills in absent types, `0` leaves them to Diaphora's C text path |
 | `PROTECT_OLD` | both halves | `1` | `0` reads the old database directly instead of a scratch copy |
 | `DIAPHORA_MINIMUM_IMPORT_RATIO` | `--port` | `0.5` | Similarity a match needs before it is imported |

@@ -9,11 +9,12 @@ into another database:
     Hex-Rays local variables and args    -> diaphora_lvars.py
     local types and function prototypes  -> diaphora_types.py
     stack frame member names and types   -> diaphora_frames.py
+    the list of functions themselves     -> diaphora_funcs.py
 
 Usage (run with idat/idat64 in batch/autonomous mode):
 
     idat64 -A -S"diaphora_dump_analysis.py folders=<p> lvars=<p> types=<p> \\
-                                           frames=<p>" \\
+                                           frames=<p> funcs=<p>" \\
            -L<logfile> <source.i64>
 
 Arguments are name=value tokens, in any order, and each one is optional --
@@ -24,8 +25,14 @@ file is left next to each output so a calling shell script can check the
 outcome without scraping IDA's log.
 
 Every dump is cheap. The folder layout is a tree walk, the local variables
-are a netnode read, and both the types and the stack frames come straight
-out of the type library: none of them decompiles anything.
+are a netnode read, the function list is a walk of the function table, and
+both the types and the stack frames come straight out of the type library:
+none of them decompiles anything.
+
+The function list is the one dump nothing here applies: it is fed to
+diaphora_apply_funcs.py, which runs against the *new* database before it is
+exported, because a function that does not exist there cannot be matched and
+so cannot be ported at all.
 
 Nothing is written into the database: like Diaphora's own exporting step,
 this ends through idaapi.qexit(), which does not save. IDA still rewrites
@@ -86,11 +93,20 @@ def _dump_frames(out_file):
   return f"{members} members, {functions} functions"
 
 
+def _dump_funcs(out_file):
+  from diaphora_funcs import dump_funcs
+
+  functions, named = dump_funcs(out_file)
+  print(f"[funcs] Dumped {functions} function(s), {named} of them named")
+  return f"{functions} functions, {named} named"
+
+
 DUMPERS = (
   ("folders", _dump_folders),
   ("lvars", _dump_lvars),
   ("types", _dump_types),
   ("frames", _dump_frames),
+  ("funcs", _dump_funcs),
 )
 
 
@@ -121,7 +137,7 @@ def main():
   try:
     args = _parse_args()
     if not args:
-      print("[dump] Nothing to do: pass folders=, lvars=, types= and/or frames=")
+      print("[dump] Nothing to do: pass folders=, lvars=, types=, frames= and/or funcs=")
       return
 
     idc.auto_wait()

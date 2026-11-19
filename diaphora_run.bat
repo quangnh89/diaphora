@@ -25,6 +25,9 @@ rem      --outdir DIR   where the AI export goes. Defaults to
 rem                     <new>_vs_<old>.aidiff next to the new database.
 rem      --no-folders   do not port the function folder layout
 rem      --no-frames    do not port the stack frame member names/types
+rem      --no-create-funcs
+rem                     do not create the functions that exist only in the
+rem                     old database
 rem      --baseline     diff with plain Diaphora and port nothing, to get
 rem                     a reference set of numbers
 rem      --force        export again even when a previous export is there
@@ -69,6 +72,7 @@ if not defined PYTHON_EXE set "PYTHON_EXE=python"
 if not defined PORT_FOLDERS set "PORT_FOLDERS=1"
 if not defined PORT_LVARS set "PORT_LVARS=1"
 if not defined PORT_FRAMES set "PORT_FRAMES=1"
+if not defined CREATE_FUNCS set "CREATE_FUNCS=1"
 if not defined PORT_TYPES set "PORT_TYPES=all"
 if not defined PROTECT_OLD set "PROTECT_OLD=1"
 if not defined USE_DECOMPILER set "USE_DECOMPILER=1"
@@ -114,6 +118,8 @@ if defined WANT_OUTDIR (
   set "PORT_LVARS=0"
 ) else if /I "%~1"=="--no-frames" (
   set "PORT_FRAMES=0"
+) else if /I "%~1"=="--no-create-funcs" (
+  set "CREATE_FUNCS=0"
 ) else if /I "%~1"=="--baseline" (
   set "DO_BASELINE=1"
 ) else if /I "%~1"=="--no-types" (
@@ -289,8 +295,11 @@ set "FOLDERS_JSON=%TMPDIR%\folders.json"
 set "LVARS_JSON=%TMPDIR%\lvars.json"
 set "TYPES_JSON=%TMPDIR%\types.json"
 set "FRAMES_JSON=%TMPDIR%\frames.json"
+set "FUNCS_JSON=%TMPDIR%\funcs.json"
+set "FUNCS_REPORT=%TMPDIR%\funcs_report.json"
 set "PORT_REPORT=%TMPDIR%\port_report.json"
 set "LOG_DUMP=%LOGDIR%\dump_old.log"
+set "LOG_FUNCS=%LOGDIR%\create_funcs.log"
 set "LOG_EXPORT_OLD=%LOGDIR%\export_old.log"
 set "LOG_EXPORT_NEW=%LOGDIR%\export_new.log"
 set "LOG_DIFF=%LOGDIR%\diff.log"
@@ -302,6 +311,7 @@ rem on which halves were asked for.
 rem Porting adds two: the dump from the OLD database, and the import itself.
 set /a TOTAL=3
 if defined DO_PORT set /a TOTAL+=2
+if defined DO_PORT if "%CREATE_FUNCS%"=="1" set /a TOTAL+=1
 if defined DO_AI set /a TOTAL+=1
 set "STEP_NO=0"
 set "FAIL_AI="
@@ -345,6 +355,17 @@ set "TYPES_ARG="
 set "FRAMES_ARG="
 set "BASELINE_ARG="
 if defined DO_BASELINE set "BASELINE_ARG=--baseline"
+
+rem The binary each database was made from usually sits next to it, named
+rem without the .i64/.idb suffix. Only used to report which of two databases
+rem of the same binary has bytes that no longer match the file, and the
+rem exporter checks the md5 before trusting it, so a stale one is harmless.
+set "NEW_BINARY_ARG="
+set "OLD_BINARY_ARG="
+for %%A in ("%NEW_IDB%") do set "NEW_BINARY=%%~dpnA"
+for %%A in ("%OLD_ORIG%") do set "OLD_BINARY=%%~dpnA"
+if exist "!NEW_BINARY!" set "NEW_BINARY_ARG=--new-binary "!NEW_BINARY!""
+if exist "!OLD_BINARY!" set "OLD_BINARY_ARG=--old-binary "!OLD_BINARY!""
 if defined DO_PORT call :dump_old
 if defined ABORT goto :abort
 
@@ -369,6 +390,20 @@ if not exist "%OLD_SQLITE%" (
   if exist "%LOG_EXPORT_OLD%" type "%LOG_EXPORT_OLD%"
   goto :abort
 )
+
+rem ---- create the functions the NEW database does not have -------------------
+rem Diaphora can only port what it matched, and it can only match a function
+rem that exists on both sides. A function auto-analysis never found in the new
+rem database -- a hypercall handler reached only through a dispatch table, say
+rem -- is invisible to the whole pipeline, so its name, types, variables and
+rem folder never move across. Measured on two databases of one binary: 218 of
+rem the old side's named functions had no function at all in the new one.
+rem
+rem This has to happen BEFORE the export below, so the new functions get
+rem diffed and ported like any other. It is also the first step that writes to
+rem the new database -- the backup above already covers it.
+if defined DO_PORT if "%CREATE_FUNCS%"=="1" call :create_funcs
+if defined ABORT goto :abort
 
 rem ---- export NEW ------------------------------------------------------------
 rem Never reused when porting: a cached new.sqlite may be one a previous import
@@ -425,7 +460,8 @@ if defined DO_AI (
     --results "%RESULTS_SQLITE%" --new "%NEW_SQLITE%" --old "%OLD_SQLITE%" ^
     --outdir "%OUTDIR%" --max-diffs %AI_DIFF_MAX_DIFFS% ^
     --context %AI_DIFF_CONTEXT% --min-ratio %AI_DIFF_MIN_RATIO% ^
-    --new-label "%NEW_LABEL%" --old-label "%OLD_LABEL%" %BASELINE_ARG%
+    --new-label "%NEW_LABEL%" --old-label "%OLD_LABEL%" %BASELINE_ARG% ^
+    %NEW_BINARY_ARG% %OLD_BINARY_ARG%
   if errorlevel 1 (
     echo [ERROR] Could not write the AI export.
     set "FAIL_AI=1"
@@ -471,9 +507,31 @@ if defined BACKUP (
 exit /b 1
 
 rem =============================================================================
+:create_funcs
+if not exist "%FUNCS_JSON%" (
+  echo        funcs:   NOT dumped, no functions can be created
+  goto :eof
+)
+call :step "Creating the functions missing from the NEW database..."
+"%IDAT_NEW%" -A -S"%DIAPHORA_DIR%\diaphora_apply_funcs.py funcs=%FUNCS_JSON% report=%FUNCS_REPORT%" -L"%LOG_FUNCS%" "%NEW_IDB%"
+if errorlevel 1 (
+  echo [ERROR] Creating functions failed, IDA exit code %errorlevel%. Log follows:
+  if exist "%LOG_FUNCS%" type "%LOG_FUNCS%"
+  echo [ERROR] Stopping rather than exporting a half built database.
+  set "ABORT=1"
+  goto :eof
+)
+if exist "%FUNCS_JSON%.applied.ok" (
+  for /f "usebackq delims=" %%L in ("%FUNCS_JSON%.applied.ok") do echo        funcs:   %%L
+) else (
+  echo        funcs:   no marker written, see %LOG_FUNCS%
+  if exist "%FUNCS_JSON%.applied.fail" type "%FUNCS_JSON%.applied.fail"
+)
+goto :eof
+
 :dump_old
 call :step "Dumping folders, local variables and types from OLD database..."
-"%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_analysis.py folders=%FOLDERS_JSON% lvars=%LVARS_JSON% types=%TYPES_JSON% frames=%FRAMES_JSON%" -L"%LOG_DUMP%" "%OLD_IDB%"
+"%IDAT_OLD%" -A -S"%DIAPHORA_DIR%\diaphora_dump_analysis.py folders=%FOLDERS_JSON% lvars=%LVARS_JSON% types=%TYPES_JSON% frames=%FRAMES_JSON% funcs=%FUNCS_JSON%" -L"%LOG_DUMP%" "%OLD_IDB%"
 rem The dump script swallows its own errors and still exits 0, so a non-zero
 rem code here means IDA itself could not open the database. Stop now instead of
 rem carrying on to the export: opening a database that just failed to open is
@@ -676,11 +734,14 @@ echo                  ^(default: ^<new^>_vs_^<old^>.aidiff next to the new datab
 echo   --no-folders   do not port the function folder layout
 echo   --no-lvars     do not port the Hex-Rays local variables
 echo   --no-frames    do not port the stack frame member names and types
+echo   --no-create-funcs  do not create the functions missing from the new database
 echo   --types MODE   "all" to replace a type the new database already has,
 echo                  "missing" to only fill in what is absent ^(default: all^)
 echo   --no-types     leave the types to Diaphora's own C text path
 echo   --no-protect-old  read the OLD database directly instead of a copy
 echo                  ^(the copy exists because opening a database rewrites it^)
+echo   --baseline     export, diff and write the AI export, but port nothing,
+echo                  for plain Diaphora's own numbers as a reference
 echo   --force        export again even when a previous export is there
 echo   -h, --help     this text
 echo.
