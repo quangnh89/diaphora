@@ -1335,9 +1335,40 @@ class CBinDiff:
       if name1 == name2:
         ratio = 1.0
 
+      # Every caller builds item as [ea1, name1, ea2, name2, desc, ratio,
+      # nodes1, nodes2], so the two addresses are right here.
+      same_ea = bool(item) and len(item) > 2 and str(item[0]) == str(item[2])
+
       if ratio != 1.0:
         if self.has_better_match(name1, name2, ratio):
           return
+
+        #
+        # Two databases putting a function at the same address is not a guess,
+        # and nothing found later may drag either side of such a pair somewhere
+        # else -- not even by claiming a higher ratio.
+        #
+        # It can claim one: find_related_compilation_unit() brute forces every
+        # function against every function inside a compilation unit, and the
+        # ratio it reports is 0.99, which is the value check_ratio() *clamps*
+        # to when r + deep_ratio() >= 1.0 rather than a measured similarity. So
+        # a clamped guess at 0.99 was beating a same-address match at its
+        # honest 0.90.
+        #
+        # Measured on two builds of hvax64.exe: of the 3658 functions for which
+        # an address heuristic found a same-address partner, exactly 17 ended up
+        # matched elsewhere, every one of them to "Related compilation unit".
+        # Fourteen were the hv_serial_reg_* accessors, which that heuristic
+        # collapsed onto a single old function -- a multimatch, and multimatches
+        # are excluded from importing, so those fourteen functions got no name,
+        # no prototype and no instruction-level port. The fourteen
+        # g_HvSerialReg* function pointers they read were the visible symptom.
+        #
+        if not same_ea:
+          for table, key in ((self.matched_primary, name1),
+                             (self.matched_secondary, name2)):
+            if table.get(key, {}).get("same_ea"):
+              return
 
         if name1 in self.matched_primary:
           if self.matched_primary[name1]["ratio"] < ratio:
@@ -1355,8 +1386,8 @@ class CBinDiff:
         if item not in self.all_matches[chooser]:
           self.all_matches[chooser].append(item)
 
-      self.matched_primary[name1] = {"name": name2, "ratio": ratio}
-      self.matched_secondary[name2] = {"name": name1, "ratio": ratio}
+      self.matched_primary[name1] = {"name": name2, "ratio": ratio, "same_ea": same_ea}
+      self.matched_secondary[name2] = {"name": name1, "ratio": ratio, "same_ea": same_ea}
 
   def has_best_match(self, name1, name2):
     """
@@ -1579,8 +1610,14 @@ class CBinDiff:
           name1 = item[1]
           name2 = item[3]
           ratio = item[5]
-          self.matched_primary[name1] = {"name": name2, "ratio": ratio}
-          self.matched_secondary[name2] = {"name": name1, "ratio": ratio}
+          # "same_ea" has to be carried over here, not just set in add_match():
+          # this function rebuilds both dicts from scratch and it runs at the
+          # top of the iteration loop that calls find_related_compilation_unit()
+          # -- so forgetting it here would disarm the rule in add_match() at
+          # exactly the moment it is needed.
+          same_ea = len(item) > 2 and str(item[0]) == str(item[2])
+          self.matched_primary[name1] = {"name": name2, "ratio": ratio, "same_ea": same_ea}
+          self.matched_secondary[name2] = {"name": name1, "ratio": ratio, "same_ea": same_ea}
 
       self.all_matches = d
 

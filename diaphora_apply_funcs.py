@@ -81,15 +81,20 @@ def main():
       except OSError as exc:
         print(f"[funcs] Could not write the report: {exc}")
 
-    if counts["created"]:
-      # Only save when something was actually created: saving rewrites the
-      # database, and there is no reason to do that for a no-op re-run.
+    changed = counts["created"] + counts["start_moved"] + counts["recreated"]
+    if changed:
+      # Only save when something was actually created or moved: saving rewrites
+      # the database, and there is no reason to do that for a no-op re-run.
       idc.save_database(idc.get_idb_path())
 
     _write_flag(
       ok_flag,
-      "%d created, %d already present, %d inside another function, %d failed"
-      % (counts["created"], counts["already_present"],
+      "%d created (%d after undefining data), %d starts moved back, %d recreated, "
+      "%d already present, %d skipped because the bytes differ, "
+      "%d inside another function, %d failed"
+      % (counts["created"], counts["created_after_undefine"],
+         counts["start_moved"], counts["recreated"],
+         counts["already_present"], counts["bytes_differ"],
          counts["inside_other"], counts["failed"]),
     )
   except Exception:

@@ -267,6 +267,41 @@ HEURISTICS.append({
 })
 
 #
+# Every address based heuristic above refuses small functions: "Same RVA" and
+# "Same RVA and hash" want 3 nodes, "Same address, nodes, edges and mnemonics"
+# wants more than one node and more than 3 instructions, and "Same address and
+# mnemonics" wants the mnemonics to be equal, which two builds of a thunk often
+# are not. A one node, five instruction stub at the same address in both
+# databases therefore reaches none of them, and what it does reach is
+# find_related_compilation_unit(), which brute forces every function in a
+# compilation unit against every other and -- among a family of near identical
+# stubs -- produces an arbitrary permutation at a clamped 0.99 ratio. That is
+# how three hv_crypto_*_thunk functions ended up wearing each other's names.
+#
+# Small and at the same address is weak evidence taken alone, which is why this
+# sits in Partial, keeps the same name guard as the heuristics above, asks for
+# the instruction counts to be close, and will not go below 0.6.
+#
+NAME = "Same RVA, small function"
+HEURISTICS.append({
+  "name":NAME,
+  "category":"Partial",
+  "ratio":HEUR_TYPE_RATIO_MAX,
+  "sql":""" select distinct """ + get_query_fields(NAME) + """
+              from functions f,
+                   diff.functions df
+             where df.rva = f.rva
+               and ((f.name = df.name and substr(f.name, 1, 4) != 'sub_')
+                or (substr(f.name, 1, 4) = 'sub_' or substr(df.name, 1, 4) = 'sub_'))
+               and (f.nodes < 3 or df.nodes < 3)
+               and abs(f.instructions - df.instructions) <= 2
+               %POSTFIX%
+             order by f.source_file = df.source_file""",
+  "min":0.6,
+  "flags":[HEUR_FLAG_SAME_CPU]
+})
+
+#
 # Seems not to find anything?
 #
 NAME = "Equal assembly or pseudo-code"

@@ -562,6 +562,36 @@ if not "%errorlevel%"=="0" (
   exit /b 0
 )
 
+rem Hand the export a pristine copy, not the one this step just had open.
+rem
+rem The dump scripts end in idaapi.qexit(), which does not close the database,
+rem so IDA leaves the unpacked .id0/.id1/.nam files behind next to the copy and
+rem whatever state they were in is what the next session picks up. Measured:
+rem one run's export then loaded the copy as `Database for file 'Y...'` with
+rem segments at 400000 instead of FFFFF80000400000 and program.md5sum NULL, and
+rem 2318 functions came out with raw addresses where their globals should have
+rem been -- which quietly turned 586 unchanged functions into "changed" in the
+rem AI export. The same step had already produced a transient
+rem "old_source.nam: Permission denied" on an earlier run.
+rem
+rem Re-copying costs one more pass over the file and removes the coupling
+rem entirely. Only possible when PROTECT_OLD kept an untouched original.
+if "%PROTECT_OLD%"=="1" (
+  copy /y "%OLD_ORIG%" "%OLD_IDB%" >nul
+  if errorlevel 1 (
+    echo [ERROR] Could not refresh the OLD database copy before exporting it.
+    set "ABORT=1"
+    exit /b 0
+  )
+  rem And remove the unpacked files, or IDA reads those instead of the copy
+  rem that was just refreshed. %%~dpn drops the extension, so this works for
+  rem an .idb as well as an .i64.
+  for %%A in ("%OLD_IDB%") do set "OLD_UNPACKED=%%~dpnA"
+  del /q "!OLD_UNPACKED!.id0" "!OLD_UNPACKED!.id1" "!OLD_UNPACKED!.id2" >nul 2>&1
+  del /q "!OLD_UNPACKED!.nam" "!OLD_UNPACKED!.til" >nul 2>&1
+  set "OLD_UNPACKED="
+)
+
 if "%PORT_FOLDERS%"=="1" (
   if exist "%FOLDERS_JSON%.ok" (
     set "FOLDERS_ARG= folders=%FOLDERS_JSON%"
